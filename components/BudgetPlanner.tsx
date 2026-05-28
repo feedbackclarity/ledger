@@ -883,7 +883,7 @@ const colors = {
   ink: '#030712',
 };
 
-const styles = {
+const styles: Record<string, React.CSSProperties> = {
   app: {
     minHeight: '100vh',
     background: colors.bg,
