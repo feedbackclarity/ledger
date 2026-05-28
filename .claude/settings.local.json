@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh auth *)",
+      "Bash(doctl auth *)",
+      "Bash(brew --version)",
+      "Read(//opt/homebrew/bin/**)"
+    ]
+  }
+}
