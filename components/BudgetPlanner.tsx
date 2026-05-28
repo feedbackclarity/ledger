@@ -261,6 +261,8 @@ export default function BudgetPlanner() {
     taxSetasidePct: 30,
     newportActive: false,
     accounts: [], // [{id, name, type: 'bank'|'card'}]
+    appName: 'Ledger',
+    theme: 'light', // 'light' | 'dark'
   });
   const [importLog, setImportLog] = useState([]); // [{id,timestamp,fileName,fileSize,kind,accountId,monthKey,txCount,skippedCount,sumAmounts,convention,txIds}]
 
@@ -282,8 +284,13 @@ export default function BudgetPlanner() {
         if (incRes) setIncome(JSON.parse(incRes.value));
         if (setRes) {
           const loaded = JSON.parse(setRes.value);
-          // Forward-compat: ensure accounts array exists for old persisted settings
-          setSettings({ ...loaded, accounts: loaded.accounts || [] });
+          // Forward-compat: ensure new fields exist for old persisted settings
+          setSettings({
+            ...loaded,
+            accounts: loaded.accounts || [],
+            appName: loaded.appName || 'Ledger',
+            theme: loaded.theme === 'dark' ? 'dark' : 'light',
+          });
         }
         if (logRes) setImportLog(JSON.parse(logRes.value));
       } catch (e) {
@@ -323,6 +330,18 @@ export default function BudgetPlanner() {
     if (loading) return;
     window.storage.set('importLog', JSON.stringify(importLog)).catch(console.error);
   }, [importLog, loading]);
+
+  // Apply theme to <html data-theme> so the CSS variables switch globally.
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    document.documentElement.dataset.theme = settings.theme === 'dark' ? 'dark' : 'light';
+  }, [settings.theme]);
+
+  // Reflect custom app name in the browser tab title.
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    if (settings.appName) document.title = settings.appName;
+  }, [settings.appName]);
 
   // ============ DERIVED STATE ============
   const monthTx = transactions[currentMonth] || [];
@@ -785,7 +804,7 @@ export default function BudgetPlanner() {
       {/* HEADER */}
       <header style={styles.header}>
         <div>
-          <h1 style={styles.brandTitle}>Ledger</h1>
+          <h1 style={styles.brandTitle}>{settings.appName || 'Ledger'}</h1>
           <div style={styles.brandKicker}>Personal Financial Operations</div>
         </div>
         <div style={styles.monthPicker}>
@@ -1525,6 +1544,38 @@ export default function BudgetPlanner() {
       {view === 'settings' && (
         <div>
           <section style={styles.section}>
+            <h2 style={styles.sectionTitle}>App Preferences</h2>
+            <div style={styles.helperText}>
+              Customize the app name shown in the header and browser tab, and pick a theme.
+            </div>
+            <div style={styles.settingsGrid}>
+              <div>
+                <label style={styles.fieldLabel}>App Name</label>
+                <input
+                  type="text"
+                  value={settings.appName || ''}
+                  onChange={e => setSettings(prev => ({ ...prev, appName: e.target.value }))}
+                  placeholder="Ledger"
+                  style={styles.bigInput}
+                />
+              </div>
+              <div>
+                <label style={styles.fieldLabel}>Theme</label>
+                <div style={styles.segmentRow}>
+                  <button
+                    style={{ ...styles.segmentBtn, ...(settings.theme !== 'dark' ? styles.segmentBtnActive : {}) }}
+                    onClick={() => setSettings(prev => ({ ...prev, theme: 'light' }))}
+                  >☀ Light</button>
+                  <button
+                    style={{ ...styles.segmentBtn, ...(settings.theme === 'dark' ? styles.segmentBtnActive : {}) }}
+                    onClick={() => setSettings(prev => ({ ...prev, theme: 'dark' }))}
+                  >☾ Dark</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section style={styles.section}>
             <h2 style={styles.sectionTitle}>Cash Cushion</h2>
             <div style={styles.helperText}>
               Your "sleep sound" number. Below the target, the system flags discretionary spend. Currently set as a fixed dollar figure per your preference.
@@ -1637,7 +1688,7 @@ export default function BudgetPlanner() {
                   setRules([]);
                   setTransactions({});
                   setIncome({});
-                  setSettings({ cushionTarget: 0, cushionCurrent: 0, taxSetasidePct: 30, newportActive: false, accounts: [] });
+                  setSettings({ cushionTarget: 0, cushionCurrent: 0, taxSetasidePct: 30, newportActive: false, accounts: [], appName: 'Ledger', theme: 'light' });
                   setImportLog([]);
                 }
               }}>Reset Everything</button>
@@ -1689,42 +1740,100 @@ function BulkActions({ transactions, categories, onBulkUpdate }) {
 }
 
 // ============ STYLES ============
+// Monarch-inspired palette. Theme is toggled by setting `data-theme` on <html>.
 const globalCss = `
   @import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  :root, [data-theme="light"] {
+    --c-bg: #fbfaf6;
+    --c-bg-card: #ffffff;
+    --c-bg-subtle: #f4f2ec;
+    --c-border: #e8e5de;
+    --c-border-strong: #d8d5cd;
+    --c-text: #1a1a1a;
+    --c-text-secondary: #3a3a3a;
+    --c-muted: #6b6b6b;
+    --c-muted-light: #9a9a9a;
+    --c-accent: #f66b36;
+    --c-accent-light: #ff8b5e;
+    --c-accent-bg: #ffe9df;
+    --c-green: #2e7d32;
+    --c-green-bg: #e8f3ea;
+    --c-red: #c62828;
+    --c-red-bg: #fce9e9;
+    --c-amber: #b7791f;
+    --c-amber-bg: #fcf3db;
+    --c-ink: #0a0a0a;
+    --c-scrollbar-thumb: #d8d5cd;
+    --c-scrollbar-thumb-hover: #b8b5ad;
+  }
+  [data-theme="dark"] {
+    --c-bg: #0f1419;
+    --c-bg-card: #1a1f26;
+    --c-bg-subtle: #151a20;
+    --c-border: #2a3038;
+    --c-border-strong: #3a4048;
+    --c-text: #f5f5f5;
+    --c-text-secondary: #d4d4d4;
+    --c-muted: #9a9ea4;
+    --c-muted-light: #6b6e72;
+    --c-accent: #ff7a45;
+    --c-accent-light: #ffa078;
+    --c-accent-bg: #3a2418;
+    --c-green: #4caf50;
+    --c-green-bg: #1a3329;
+    --c-red: #ef5350;
+    --c-red-bg: #3a1e1c;
+    --c-amber: #ffa726;
+    --c-amber-bg: #3a2e15;
+    --c-ink: #ffffff;
+    --c-scrollbar-thumb: #3a4048;
+    --c-scrollbar-thumb-hover: #4a5058;
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; background: #f7f8fa; }
+  html, body {
+    margin: 0;
+    background: var(--c-bg);
+    color: var(--c-text);
+    transition: background-color 160ms, color 160ms;
+  }
   input:focus, select:focus, textarea:focus, button:focus {
-    outline: 2px solid #0f4c75;
+    outline: 2px solid var(--c-accent);
     outline-offset: 1px;
   }
   input, select, textarea, button {
     font-family: 'Inter', sans-serif;
+    color: inherit;
+  }
+  input, select, textarea {
+    background: var(--c-bg-card);
+    border-color: var(--c-border-strong);
   }
   ::-webkit-scrollbar { width: 10px; height: 10px; }
-  ::-webkit-scrollbar-track { background: #f7f8fa; }
-  ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 5px; }
-  ::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+  ::-webkit-scrollbar-track { background: var(--c-bg); }
+  ::-webkit-scrollbar-thumb { background: var(--c-scrollbar-thumb); border-radius: 5px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--c-scrollbar-thumb-hover); }
 `;
 
 const colors = {
-  bg: '#f7f8fa',           // page background
-  bgCard: '#ffffff',       // white cards
-  bgSubtle: '#f9fafb',     // subtle gray (table headers, etc)
-  border: '#e5e7eb',        // soft gray border
-  borderStrong: '#d1d5db',  // stronger border
-  text: '#111827',          // primary text
-  textSecondary: '#374151',
-  muted: '#6b7280',
-  mutedLight: '#9ca3af',
-  accent: '#0f4c75',        // deep navy
-  accentLight: '#3282b8',
-  green: '#059669',
-  greenBg: '#ecfdf5',
-  red: '#dc2626',
-  redBg: '#fef2f2',
-  amber: '#d97706',
-  amberBg: '#fffbeb',
-  ink: '#030712',
+  bg: 'var(--c-bg)',
+  bgCard: 'var(--c-bg-card)',
+  bgSubtle: 'var(--c-bg-subtle)',
+  border: 'var(--c-border)',
+  borderStrong: 'var(--c-border-strong)',
+  text: 'var(--c-text)',
+  textSecondary: 'var(--c-text-secondary)',
+  muted: 'var(--c-muted)',
+  mutedLight: 'var(--c-muted-light)',
+  accent: 'var(--c-accent)',
+  accentLight: 'var(--c-accent-light)',
+  accentBg: 'var(--c-accent-bg)',
+  green: 'var(--c-green)',
+  greenBg: 'var(--c-green-bg)',
+  red: 'var(--c-red)',
+  redBg: 'var(--c-red-bg)',
+  amber: 'var(--c-amber)',
+  amberBg: 'var(--c-amber-bg)',
+  ink: 'var(--c-ink)',
 };
 
 const styles: Record<string, React.CSSProperties> = {
