@@ -1288,7 +1288,7 @@ export default function BudgetPlanner() {
                   <span style={{flex: 1}}>Account / File</span>
                   <span style={{flex: '0 0 70px', textAlign: 'right'}}>Tx</span>
                   <span style={{flex: '0 0 110px', textAlign: 'right'}}>Total</span>
-                  <span style={{flex: '0 0 30px'}}></span>
+                  <span style={{flex: '0 0 130px', textAlign: 'right'}}>Actions</span>
                 </div>
                 {importLog.map((e, i) => {
                   const acctName = (settings.accounts || []).find(a => a.id === e.accountId)?.name;
@@ -1302,13 +1302,34 @@ export default function BudgetPlanner() {
                       </span>
                       <span style={{flex: '0 0 70px', textAlign: 'right', fontSize: 13}}>{e.txCount}{e.skippedCount ? ` (-${e.skippedCount})` : ''}</span>
                       <span style={{flex: '0 0 110px', textAlign: 'right', fontSize: 13, fontWeight: 500}}>{fmtCents(e.sumAmounts)}</span>
-                      <button
-                        style={styles.deleteBtn}
-                        onClick={() => {
-                          if (!confirm('Delete this import-log entry? Transactions themselves stay; only the log row is removed.')) return;
-                          setImportLog(prev => prev.filter(x => x.id !== e.id));
-                        }}
-                      >×</button>
+                      <span style={{flex: '0 0 130px', display: 'flex', gap: 6, justifyContent: 'flex-end'}}>
+                        <button
+                          style={styles.linkBtn}
+                          title="Remove log entry only; keep transactions"
+                          onClick={() => {
+                            if (!confirm('Delete this import-log entry? Transactions themselves stay; only the log row is removed.')) return;
+                            setImportLog(prev => prev.filter(x => x.id !== e.id));
+                          }}
+                        >Remove</button>
+                        <button
+                          style={{...styles.linkBtn, color: colors.red}}
+                          title="Remove log entry AND delete the transactions it imported"
+                          disabled={!Array.isArray(e.txIds) || e.txIds.length === 0}
+                          onClick={() => {
+                            const ids = Array.isArray(e.txIds) ? e.txIds : [];
+                            if (ids.length === 0) return;
+                            if (!confirm(`Delete this import-log entry AND remove the ${ids.length} transaction${ids.length === 1 ? '' : 's'} it imported? This cannot be undone.`)) return;
+                            const idSet = new Set(ids);
+                            setTransactions(prev => {
+                              const next = { ...prev };
+                              const list = (next[e.monthKey] || []).filter(t => !idSet.has(t.id));
+                              if (list.length === 0) delete next[e.monthKey]; else next[e.monthKey] = list;
+                              return next;
+                            });
+                            setImportLog(prev => prev.filter(x => x.id !== e.id));
+                          }}
+                        >Remove + tx</button>
+                      </span>
                     </div>
                   );
                 })}
