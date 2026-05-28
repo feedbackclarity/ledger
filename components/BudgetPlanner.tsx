@@ -247,6 +247,7 @@ function parseStatementText(raw) {
 export default function BudgetPlanner() {
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState('dashboard'); // dashboard, transactions, categories, settings, import
+  const [dashboardView, setDashboardView] = useState('personal'); // 'personal' | 'business-transfers'
   const [currentMonth, setCurrentMonth] = useState(monthKey(new Date()));
 
   // Core state
@@ -259,24 +260,32 @@ export default function BudgetPlanner() {
     cushionCurrent: 0,
     taxSetasidePct: 30,
     newportActive: false,
+    accounts: [], // [{id, name, type: 'bank'|'card'}]
   });
+  const [importLog, setImportLog] = useState([]); // [{id,timestamp,fileName,fileSize,kind,accountId,monthKey,txCount,skippedCount,sumAmounts,convention,txIds}]
 
   // Load from storage on mount
   useEffect(() => {
     (async () => {
       try {
-        const [catsRes, rulesRes, txRes, incRes, setRes] = await Promise.all([
+        const [catsRes, rulesRes, txRes, incRes, setRes, logRes] = await Promise.all([
           window.storage.get('categories').catch(() => null),
           window.storage.get('rules').catch(() => null),
           window.storage.get('transactions').catch(() => null),
           window.storage.get('income').catch(() => null),
           window.storage.get('settings').catch(() => null),
+          window.storage.get('importLog').catch(() => null),
         ]);
         if (catsRes) setCategories(JSON.parse(catsRes.value));
         if (rulesRes) setRules(JSON.parse(rulesRes.value));
         if (txRes) setTransactions(JSON.parse(txRes.value));
         if (incRes) setIncome(JSON.parse(incRes.value));
-        if (setRes) setSettings(JSON.parse(setRes.value));
+        if (setRes) {
+          const loaded = JSON.parse(setRes.value);
+          // Forward-compat: ensure accounts array exists for old persisted settings
+          setSettings({ ...loaded, accounts: loaded.accounts || [] });
+        }
+        if (logRes) setImportLog(JSON.parse(logRes.value));
       } catch (e) {
         console.log('First run or storage error', e);
       }
@@ -309,6 +318,11 @@ export default function BudgetPlanner() {
     if (loading) return;
     window.storage.set('settings', JSON.stringify(settings)).catch(console.error);
   }, [settings, loading]);
+
+  useEffect(() => {
+    if (loading) return;
+    window.storage.set('importLog', JSON.stringify(importLog)).catch(console.error);
+  }, [importLog, loading]);
 
   // ============ DERIVED STATE ============
   const monthTx = transactions[currentMonth] || [];
@@ -393,14 +407,88 @@ export default function BudgetPlanner() {
   const [isDragging, setIsDragging] = useState(false);
   const [parsing, setParsing] = useState(false);
   const [loadedFileName, setLoadedFileName] = useState(null);
+  const [pendingFile, setPendingFile] = useState(null); // { name, size, kind }
+  const [importAccountId, setImportAccountId] = useState('');
   const [learnStatus, setLearnStatus] = useState('');
   const [suggesting, setSuggesting] = useState(false);
+  const [insightsByMonth, setInsightsByMonth] = useState({}); // { monthKey: { insights, generatedAt } }
+  const [generatingInsights, setGeneratingInsights] = useState(false);
+  const [insightsError, setInsightsError] = useState('');
 
   useEffect(() => {
     if (!learnStatus) return;
     const t = setTimeout(() => setLearnStatus(''), 6000);
     return () => clearTimeout(t);
   }, [learnStatus]);
+
+  // Load cached insights for whichever month we're viewing.
+  useEffect(() => {
+    if (loading) return;
+    if (insightsByMonth[currentMonth]) return; // already in memory
+    window.storage.get(`insights:${currentMonth}`).then((res) => {
+      if (!res) return;
+      try {
+        const data = JSON.parse(res.value);
+        setInsightsByMonth((prev) => ({ ...prev, [currentMonth]: data }));
+      } catch { /* ignore corrupt cache */ }
+    }).catch(() => {});
+  }, [currentMonth, loading]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const getInsights = async () => {
+    setGeneratingInsights(true);
+    setInsightsError('');
+    try {
+      const cats = categories.map(c => ({
+        id: c.id,
+        name: c.name,
+        floor: c.floor || 0,
+        stretch: c.stretch || 0,
+        actual: spendByCategory[c.id] || 0,
+        discretionary: !!c.discretionary,
+      }));
+      const topMerchants = personalTx
+        .slice()
+        .sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount))
+        .slice(0, 10)
+        .map(t => ({ description: t.description, amount: t.amount, category: t.category || 'uncategorized' }));
+      const payload = {
+        month: currentMonth,
+        spendableIncome,
+        totalSpend,
+        cushionCurrent: settings.cushionCurrent,
+        cushionTarget: settings.cushionTarget,
+        categories: cats,
+        topMerchants,
+      };
+      const r = await fetch('/api/insights', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const ct = r.headers.get('content-type') || '';
+      const text = await r.text();
+      if (!ct.toLowerCase().includes('application/json')) {
+        setInsightsError(`AI error (HTTP ${r.status}): ${(text || '').slice(0, 200)}`);
+        return;
+      }
+      let j;
+      try { j = JSON.parse(text); } catch {
+        setInsightsError(`AI error (HTTP ${r.status}): invalid JSON body`);
+        return;
+      }
+      if (!r.ok) {
+        setInsightsError(`AI error (HTTP ${r.status}): ${j.error || 'unknown'}`);
+        return;
+      }
+      const data = { insights: j.insights || [], generatedAt: j.generatedAt || Date.now() };
+      setInsightsByMonth(prev => ({ ...prev, [currentMonth]: data }));
+      window.storage.set(`insights:${currentMonth}`, JSON.stringify(data)).catch(console.error);
+    } catch (e) {
+      setInsightsError(`AI request failed: ${(e && e.message) || 'unknown'}`);
+    } finally {
+      setGeneratingInsights(false);
+    }
+  };
 
   const suggestCategories = async () => {
     const uncat = (transactions[currentMonth] || []).filter(t => !t.category || t.category === 'uncategorized');
@@ -533,13 +621,17 @@ export default function BudgetPlanner() {
     setParsing(true);
     setImportStatus('');
     setLoadedFileName(null);
+    setPendingFile(null);
     const name = (file.name || '').toLowerCase();
     const looksText = /\.(csv|tsv|txt)$/.test(name) || (file.type || '').startsWith('text/');
+    const ext = (name.match(/\.([a-z0-9]+)$/) || [, ''])[1];
+    const kind = ext === 'pdf' ? 'pdf' : (ext === 'tsv' ? 'tsv' : (ext === 'txt' ? 'txt' : 'csv'));
     try {
       if (looksText && file.size < 2 * 1024 * 1024) {
         const text = await file.text();
         setImportText(text);
         setLoadedFileName(file.name);
+        setPendingFile({ name: file.name, size: file.size, kind });
         setImportStatus(`Loaded ${file.name} (${(file.size/1024).toFixed(1)} KB). Review below, then Import.`);
       } else {
         const fd = new FormData();
@@ -549,6 +641,7 @@ export default function BudgetPlanner() {
         if (!r.ok) { setImportStatus(j.error || 'Failed to parse file'); return; }
         setImportText(j.text);
         setLoadedFileName(file.name);
+        setPendingFile({ name: file.name, size: file.size, kind });
         const detail = j.kind === 'pdf' ? `${j.pages} pages` : `${((j.text || '').length/1024).toFixed(1)} KB text`;
         setImportStatus(`Loaded ${file.name} (${detail}). Review below, then Import.`);
       }
@@ -583,10 +676,33 @@ export default function BudgetPlanner() {
       ...prev,
       [currentMonth]: [...(prev[currentMonth] || []), ...newTx],
     }));
+
+    // Record an import-log entry. Account is whatever was picked; if blank,
+    // we still log it so the user can see the history (the checklist just won't tick).
+    const sumAmounts = newTx.reduce((s, t) => s + t.amount, 0);
+    const logEntry = {
+      id: `log-${stamp}`,
+      timestamp: stamp,
+      fileName: pendingFile ? pendingFile.name : (loadedFileName || 'pasted text'),
+      fileSize: pendingFile ? pendingFile.size : 0,
+      kind: pendingFile ? pendingFile.kind : 'paste',
+      accountId: importAccountId || '',
+      monthKey: currentMonth,
+      txCount: newTx.length,
+      skippedCount: parsed.skipped || 0,
+      sumAmounts,
+      convention,
+      txIds: newTx.map(t => t.id),
+    };
+    setImportLog(prev => [logEntry, ...prev]);
+
+    const acctName = (settings.accounts || []).find(a => a.id === importAccountId)?.name;
+    const acctNote = acctName ? ` from ${acctName}` : '';
     const kind = convention === 'credit-card' ? 'credit-card export' : 'bank export';
-    setImportStatus(`Imported ${newTx.length} transactions${parsed.skipped ? `, skipped ${parsed.skipped}` : ''}. Detected ${kind}; review in Transactions.`);
+    setImportStatus(`Imported ${newTx.length} transactions${parsed.skipped ? `, skipped ${parsed.skipped}` : ''}${acctNote}. Detected ${kind}; review in Transactions.`);
     setImportText('');
     setLoadedFileName(null);
+    setPendingFile(null);
   };
 
   // ============ TX OPERATIONS ============
@@ -711,6 +827,20 @@ export default function BudgetPlanner() {
       {/* ============ DASHBOARD ============ */}
       {view === 'dashboard' && (
         <div>
+          {/* Personal ↔ Business & Transfers toggle */}
+          <div style={styles.segmentRow}>
+            <button
+              style={{ ...styles.segmentBtn, ...(dashboardView === 'personal' ? styles.segmentBtnActive : {}) }}
+              onClick={() => setDashboardView('personal')}
+            >Personal P&L</button>
+            <button
+              style={{ ...styles.segmentBtn, ...(dashboardView === 'business-transfers' ? styles.segmentBtnActive : {}) }}
+              onClick={() => setDashboardView('business-transfers')}
+            >Business &amp; Transfers</button>
+          </div>
+
+          {dashboardView === 'personal' && (
+          <>
           {/* Top status strip — cushion + monthly snapshot */}
           <section style={styles.statusStrip}>
             <div style={styles.statusCard}>
@@ -856,6 +986,163 @@ export default function BudgetPlanner() {
               ))}
             </div>
           </section>
+
+          {(() => {
+            const cached = insightsByMonth[currentMonth];
+            return (
+              <section style={styles.section}>
+                <h2 style={styles.sectionTitle}>AI Insights — what to cut, what to keep</h2>
+                {!cached ? (
+                  <>
+                    <div style={styles.helperText}>
+                      Get Claude's read on this month's spend against your floor and stretch.
+                    </div>
+                    <button style={styles.primaryBtn} onClick={getInsights} disabled={generatingInsights}>
+                      {generatingInsights ? 'Asking Claude…' : '✨ Generate insights for this month'}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12}}>
+                      <span style={{color: colors.muted, fontSize: 12}}>
+                        Generated {new Date(cached.generatedAt).toLocaleString()}
+                      </span>
+                      <button style={styles.linkBtn} onClick={getInsights} disabled={generatingInsights}>
+                        {generatingInsights ? 'Refreshing…' : '↻ Refresh'}
+                      </button>
+                    </div>
+                    {(!cached.insights || cached.insights.length === 0) ? (
+                      <div style={styles.emptyState}>No insights returned. Try again.</div>
+                    ) : (
+                      <div style={{display: 'flex', flexDirection: 'column', gap: 10}}>
+                        {cached.insights.map((ins, i) => {
+                          const sev = (ins.severity || 'medium').toLowerCase();
+                          const variant = sev === 'high' ? styles.insightHigh : (sev === 'low' ? styles.insightLow : styles.insightMedium);
+                          const catName = (categories.find(c => c.id === ins.category)?.name) || ins.category;
+                          return (
+                            <div key={i} style={{...styles.insightCard, ...variant}}>
+                              <div style={styles.insightMeta}>
+                                <span style={{fontWeight: 700, textTransform: 'uppercase', fontSize: 11, letterSpacing: 0.5}}>{sev}</span>
+                                {ins.action && <span style={{textTransform: 'capitalize', fontSize: 12, opacity: 0.75}}>· {ins.action}</span>}
+                                {catName && <span style={{fontSize: 12, opacity: 0.75}}>· {catName}</span>}
+                              </div>
+                              <div style={{fontSize: 14, lineHeight: 1.5}}>{ins.message}</div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </>
+                )}
+                {insightsError && <div style={styles.statusMsgError}>{insightsError}</div>}
+              </section>
+            );
+          })()}
+          </>
+          )}
+
+          {dashboardView === 'business-transfers' && (() => {
+            const incomeTx = monthTx.filter(t => t.classification === 'income');
+            const businessTx = monthTx.filter(t => t.classification === 'business');
+            const transferTx = monthTx.filter(t => t.classification === 'transfer');
+            const sum = (xs) => xs.reduce((s, t) => s + t.amount, 0);
+            const incomeTotal = sum(incomeTx);
+            const businessTotal = sum(businessTx);
+            const transferTotal = sum(transferTx);
+            const businessByCat = {};
+            businessTx.forEach(t => {
+              const k = t.category || 'uncategorized';
+              if (!businessByCat[k]) businessByCat[k] = { tx: [], total: 0 };
+              businessByCat[k].tx.push(t);
+              businessByCat[k].total += t.amount;
+            });
+            const catName = (id) => (categories.find(c => c.id === id)?.name) || id;
+
+            return (
+              <>
+                <section style={styles.statusStrip}>
+                  <div style={styles.statusCard}>
+                    <div style={styles.statusLabel}>Income</div>
+                    <div style={styles.statusBig}>{fmt(incomeTotal)}</div>
+                    <div style={styles.statusSub}>{incomeTx.length} {incomeTx.length === 1 ? 'entry' : 'entries'}</div>
+                  </div>
+                  <div style={styles.statusCard}>
+                    <div style={styles.statusLabel}>Business Expenses</div>
+                    <div style={styles.statusBig}>{fmt(Math.abs(businessTotal))}</div>
+                    <div style={styles.statusSub}>{businessTx.length} {businessTx.length === 1 ? 'entry' : 'entries'}</div>
+                  </div>
+                  <div style={styles.statusCard}>
+                    <div style={styles.statusLabel}>Transfers</div>
+                    <div style={styles.statusBig}>{fmt(Math.abs(transferTotal))}</div>
+                    <div style={styles.statusSub}>{transferTx.length} {transferTx.length === 1 ? 'entry' : 'entries'}</div>
+                  </div>
+                </section>
+
+                <section style={styles.section}>
+                  <h2 style={styles.sectionTitle}>Income — {monthLabel(currentMonth)}</h2>
+                  {incomeTx.length === 0 ? (
+                    <div style={styles.emptyState}>No income recorded this month.</div>
+                  ) : (
+                    <div style={styles.btTable}>
+                      {incomeTx.map(t => (
+                        <div key={t.id} style={styles.btRow}>
+                          <div style={{flex: '0 0 110px', color: colors.muted}}>{t.date}</div>
+                          <div style={{flex: 1}}>{t.description}</div>
+                          <div style={{flex: '0 0 110px', textAlign: 'right', color: colors.green, fontWeight: 600}}>{fmtCents(t.amount)}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </section>
+
+                <section style={styles.section}>
+                  <h2 style={styles.sectionTitle}>Business Expenses — {monthLabel(currentMonth)}</h2>
+                  {businessTx.length === 0 ? (
+                    <div style={styles.emptyState}>No business expenses recorded this month.</div>
+                  ) : (
+                    Object.entries(businessByCat).map(([catId, group]) => {
+                      const { tx, total } = group as { tx: any[]; total: number };
+                      return (
+                      <div key={catId} style={{marginBottom: 18}}>
+                        <div style={styles.btCatHeader}>
+                          <span style={{fontWeight: 600}}>{catName(catId)}</span>
+                          <span style={{color: colors.muted}}>{tx.length} {tx.length === 1 ? 'entry' : 'entries'}</span>
+                          <span style={{marginLeft: 'auto', fontWeight: 600}}>{fmtCents(Math.abs(total))}</span>
+                        </div>
+                        <div style={styles.btTable}>
+                          {tx.map(t => (
+                            <div key={t.id} style={styles.btRow}>
+                              <div style={{flex: '0 0 110px', color: colors.muted}}>{t.date}</div>
+                              <div style={{flex: 1}}>{t.description}</div>
+                              <div style={{flex: '0 0 110px', textAlign: 'right'}}>{fmtCents(t.amount)}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                    })
+                  )}
+                </section>
+
+                <section style={styles.section}>
+                  <h2 style={styles.sectionTitle}>Transfers — {monthLabel(currentMonth)}</h2>
+                  {transferTx.length === 0 ? (
+                    <div style={styles.emptyState}>No transfers recorded this month.</div>
+                  ) : (
+                    <div style={styles.btTable}>
+                      {transferTx.map(t => (
+                        <div key={t.id} style={styles.btRow}>
+                          <div style={{flex: '0 0 110px', color: colors.muted}}>{t.date}</div>
+                          <div style={{flex: 1}}>{t.description}</div>
+                          <div style={{flex: '0 0 110px', textAlign: 'right'}}>{fmtCents(t.amount)}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </section>
+              </>
+            );
+          })()}
         </div>
       )}
 
@@ -868,6 +1155,23 @@ export default function BudgetPlanner() {
               Drop a <strong>CSV, TSV, TXT, or PDF</strong> statement onto the box below, or click to choose a file.
               Columns and delimiter are auto-detected. You can also paste rows directly into the textarea.
               Negative amounts are spend; positive amounts are flagged as <strong>transfers</strong> for review.
+            </div>
+
+            <div style={{display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10}}>
+              <label style={{...styles.fieldLabel, marginBottom: 0}}>Account:</label>
+              <select
+                value={importAccountId}
+                onChange={e => setImportAccountId(e.target.value)}
+                style={{...styles.selectSm, minWidth: 220}}
+              >
+                <option value="">— pick an account —</option>
+                {(settings.accounts || []).map((a) => (
+                  <option key={a.id} value={a.id}>{a.name} ({a.type})</option>
+                ))}
+              </select>
+              {(settings.accounts || []).length === 0 && (
+                <button style={styles.linkBtn} onClick={() => setView('settings')}>+ Add one in Settings</button>
+              )}
             </div>
 
             <div
@@ -923,6 +1227,34 @@ export default function BudgetPlanner() {
             )}
           </section>
 
+          {(settings.accounts || []).length > 0 && (() => {
+            const accts = settings.accounts || [];
+            const importedAccountIds = new Set(
+              importLog.filter(e => e.monthKey === currentMonth && e.accountId).map(e => e.accountId)
+            );
+            const doneCount = accts.filter(a => importedAccountIds.has(a.id)).length;
+            return (
+              <section style={styles.section}>
+                <h3 style={styles.sectionTitle}>
+                  Statements Expected — {monthLabel(currentMonth)} ({doneCount} of {accts.length} imported)
+                </h3>
+                <div style={styles.checklist}>
+                  {accts.map((a) => {
+                    const done = importedAccountIds.has(a.id);
+                    return (
+                      <div key={a.id} style={{...styles.checkItem, opacity: done ? 0.55 : 1}}>
+                        <span style={{...styles.checkBox, ...(done ? styles.checkBoxDone : {})}}>{done ? '✓' : '○'}</span>
+                        <span style={done ? {textDecoration: 'line-through'} : {}}>
+                          {a.name} <span style={{color: colors.muted, fontSize: 12, textTransform: 'capitalize'}}>({a.type})</span>
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            );
+          })()}
+
           <section style={styles.section}>
             <h3 style={styles.sectionTitle}>Learned Merchant Rules</h3>
             <div style={styles.helperText}>
@@ -937,6 +1269,49 @@ export default function BudgetPlanner() {
                     <button style={styles.deleteBtn} onClick={() => setRules(prev => prev.filter((_, idx) => idx !== i))}>×</button>
                   </div>
                 ))}
+              </div>
+            )}
+          </section>
+
+          <section style={styles.section}>
+            <h3 style={styles.sectionTitle}>Import Log</h3>
+            <div style={styles.helperText}>
+              {importLog.length === 0
+                ? 'No imports yet.'
+                : `${importLog.length} imports recorded. Showing newest first.`}
+            </div>
+            {importLog.length > 0 && (
+              <div style={styles.rulesTable}>
+                <div style={{...styles.ruleRow, fontWeight: 600, color: colors.muted, fontSize: 12, textTransform: 'uppercase', letterSpacing: 0.4}}>
+                  <span style={{flex: '0 0 110px'}}>Date</span>
+                  <span style={{flex: '0 0 90px'}}>Month</span>
+                  <span style={{flex: 1}}>Account / File</span>
+                  <span style={{flex: '0 0 70px', textAlign: 'right'}}>Tx</span>
+                  <span style={{flex: '0 0 110px', textAlign: 'right'}}>Total</span>
+                  <span style={{flex: '0 0 30px'}}></span>
+                </div>
+                {importLog.map((e, i) => {
+                  const acctName = (settings.accounts || []).find(a => a.id === e.accountId)?.name;
+                  return (
+                    <div key={e.id || i} style={styles.ruleRow}>
+                      <span style={{flex: '0 0 110px', color: colors.muted, fontSize: 12}}>{new Date(e.timestamp).toLocaleDateString()}</span>
+                      <span style={{flex: '0 0 90px', color: colors.muted, fontSize: 12}}>{e.monthKey}</span>
+                      <span style={{flex: 1, fontSize: 13}}>
+                        <strong>{acctName || (e.accountId ? '(unknown account)' : 'Untagged')}</strong>
+                        <span style={{color: colors.muted, marginLeft: 8}}>{e.fileName}</span>
+                      </span>
+                      <span style={{flex: '0 0 70px', textAlign: 'right', fontSize: 13}}>{e.txCount}{e.skippedCount ? ` (-${e.skippedCount})` : ''}</span>
+                      <span style={{flex: '0 0 110px', textAlign: 'right', fontSize: 13, fontWeight: 500}}>{fmtCents(e.sumAmounts)}</span>
+                      <button
+                        style={styles.deleteBtn}
+                        onClick={() => {
+                          if (!confirm('Delete this import-log entry? Transactions themselves stay; only the log row is removed.')) return;
+                          setImportLog(prev => prev.filter(x => x.id !== e.id));
+                        }}
+                      >×</button>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </section>
@@ -1176,6 +1551,39 @@ export default function BudgetPlanner() {
           </section>
 
           <section style={styles.section}>
+            <h2 style={styles.sectionTitle}>Accounts</h2>
+            <div style={styles.helperText}>
+              List the bank and credit-card accounts you use. The Import view will use these for the per-month statement checklist and to tag each upload.
+            </div>
+            {(settings.accounts || []).length === 0 ? (
+              <div style={styles.emptyState}>No accounts yet. Add your first below.</div>
+            ) : (
+              <div style={styles.rulesTable}>
+                {(settings.accounts || []).map((a) => (
+                  <div key={a.id} style={styles.ruleRow}>
+                    <span style={{flex: 1, fontWeight: 500}}>{a.name}</span>
+                    <span style={{flex: '0 0 100px', color: colors.muted, textTransform: 'capitalize'}}>{a.type}</span>
+                    <button
+                      style={styles.deleteBtn}
+                      onClick={() => setSettings(prev => ({ ...prev, accounts: (prev.accounts || []).filter((x) => x.id !== a.id) }))}
+                    >×</button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div style={{...styles.btnRow, marginTop: 14}}>
+              <button style={styles.secondaryBtn} onClick={() => {
+                const name = prompt('Account name (e.g. "Chase Sapphire", "BofA Checking"):');
+                if (!name) return;
+                const typeIn = prompt('Type — "bank" or "card":', 'card');
+                const type = (typeIn || '').toLowerCase() === 'bank' ? 'bank' : 'card';
+                const id = name.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '-' + Date.now().toString(36);
+                setSettings(prev => ({ ...prev, accounts: [...(prev.accounts || []), { id, name, type }] }));
+              }}>+ Add Account</button>
+            </div>
+          </section>
+
+          <section style={styles.section}>
             <h2 style={styles.sectionTitle}>Newport Beach</h2>
             <div style={styles.helperText}>
               Toggle this ON to fold Newport carrying costs into your floor budget and runway calculations. Set the Newport sub-line targets on the Categories tab.
@@ -1208,7 +1616,8 @@ export default function BudgetPlanner() {
                   setRules([]);
                   setTransactions({});
                   setIncome({});
-                  setSettings({ cushionTarget: 0, cushionCurrent: 0, taxSetasidePct: 30, newportActive: false });
+                  setSettings({ cushionTarget: 0, cushionCurrent: 0, taxSetasidePct: 30, newportActive: false, accounts: [] });
+                  setImportLog([]);
                 }
               }}>Reset Everything</button>
             </div>
@@ -1727,6 +2136,85 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 13,
     borderRadius: 8,
     fontWeight: 500,
+  },
+  insightCard: {
+    padding: '12px 14px',
+    borderRadius: 8,
+    border: `1px solid ${colors.border}`,
+    background: colors.bgCard,
+  },
+  insightMeta: {
+    display: 'flex',
+    alignItems: 'baseline',
+    gap: 8,
+    marginBottom: 6,
+  },
+  insightHigh: {
+    background: colors.redBg,
+    borderColor: '#fecaca',
+    color: colors.red,
+  },
+  insightMedium: {
+    background: colors.amberBg,
+    borderColor: '#fcd34d',
+    color: colors.amber,
+  },
+  insightLow: {
+    background: colors.greenBg,
+    borderColor: '#a7f3d0',
+    color: '#065f46',
+  },
+  segmentRow: {
+    display: 'flex',
+    gap: 4,
+    marginBottom: 16,
+    padding: 4,
+    background: colors.bgSubtle,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 10,
+    width: 'fit-content',
+  },
+  segmentBtn: {
+    padding: '8px 16px',
+    fontSize: 13,
+    fontWeight: 500,
+    border: 'none',
+    background: 'transparent',
+    color: colors.muted,
+    borderRadius: 6,
+    cursor: 'pointer',
+    transition: 'background 120ms, color 120ms',
+  },
+  segmentBtnActive: {
+    background: colors.bgCard,
+    color: colors.text,
+    boxShadow: '0 1px 2px rgba(0,0,0,0.06)',
+    fontWeight: 600,
+  },
+  btTable: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 2,
+  },
+  btRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 12,
+    padding: '8px 12px',
+    background: colors.bgCard,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 6,
+    fontSize: 13,
+  },
+  btCatHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    padding: '8px 12px',
+    background: colors.bgSubtle,
+    borderRadius: 6,
+    marginBottom: 4,
+    fontSize: 13,
   },
   aiBar: {
     display: 'flex',
