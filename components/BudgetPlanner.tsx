@@ -407,41 +407,120 @@ export default function BudgetPlanner() {
     if (uncat.length === 0) return;
     setSuggesting(true);
     setLearnStatus('');
-    try {
-      const r = await fetch('/api/suggest-category', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          transactions: uncat.map(t => ({ description: t.description, amount: t.amount })),
-          categories: categories.map(c => ({ id: c.id, name: c.name })),
-        }),
+
+    const CHUNK_SIZE = 25;
+    const RETRY_DELAYS = [500, 1500]; // ms before attempts 2 (single retry on top of initial)
+    const sleep = (ms) => new Promise(res => setTimeout(res, ms));
+
+    // Fetch one chunk with retry-on-5xx / retry-on-non-JSON. Returns { ok, suggestions? , error? }.
+    const fetchChunk = async (chunkTx) => {
+      const payload = JSON.stringify({
+        transactions: chunkTx.map(t => ({ description: t.description, amount: t.amount })),
+        categories: categories.map(c => ({ id: c.id, name: c.name })),
       });
-      const j = await r.json();
-      if (!r.ok) { setLearnStatus(`AI error: ${j.error || 'unknown'}`); return; }
-      const suggestions = j.suggestions;
-      if (!Array.isArray(suggestions) || suggestions.length !== uncat.length) {
-        setLearnStatus(`AI returned ${Array.isArray(suggestions) ? suggestions.length : 0} suggestions for ${uncat.length} transactions`);
-        return;
-      }
-      let applied = 0;
-      const learnQueue = [];
-      setTransactions(prev => {
-        const monthTxs = (prev[currentMonth] || []).slice();
-        for (let i = 0; i < uncat.length; i++) {
-          const cat = suggestions[i];
-          if (!cat || cat === 'uncategorized') continue;
-          const idx = monthTxs.findIndex(t => t.id === uncat[i].id);
-          if (idx >= 0 && monthTxs[idx].category !== cat) {
-            monthTxs[idx] = { ...monthTxs[idx], category: cat };
-            applied++;
-            learnQueue.push({ ...monthTxs[idx] });
-          }
+      let lastErr = 'unknown';
+      let lastStatus = 0;
+      // 2 attempts total: initial + 1 retry. Backoffs: 500ms before attempt 2.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0) await sleep(RETRY_DELAYS[attempt - 1] ?? 1500);
+        let r;
+        try {
+          r = await fetch('/api/suggest-category', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: payload,
+          });
+        } catch (netErr) {
+          lastErr = (netErr && netErr.message) || 'network error';
+          lastStatus = 0;
+          continue;
         }
-        return { ...prev, [currentMonth]: monthTxs };
-      });
-      // Persist learned merchant -> category and apply retroactively across months.
-      learnQueue.forEach(t => learnFromTx(t));
-      setLearnStatus(`AI suggested ${applied} categor${applied === 1 ? 'y' : 'ies'}. Review and override any that look wrong — your overrides become new rules.`);
+        const ct = r.headers.get('content-type') || '';
+        const isJson = ct.toLowerCase().includes('application/json');
+        const rawText = await r.text();
+        // Retry on 5xx or any non-JSON response (covers DO/Cloudflare HTML error pages).
+        if (r.status >= 500 || !isJson) {
+          lastStatus = r.status;
+          const snippet = (rawText || '').trim().slice(0, 200);
+          lastErr = isJson
+            ? `HTTP ${r.status}`
+            : `HTTP ${r.status}: ${snippet || r.statusText || 'non-JSON response'}`;
+          continue;
+        }
+        let j;
+        try { j = JSON.parse(rawText); } catch {
+          lastStatus = r.status;
+          lastErr = `HTTP ${r.status}: invalid JSON body`;
+          continue;
+        }
+        if (!r.ok) {
+          return { ok: false, error: `AI error (HTTP ${r.status}): ${j.error || 'unknown'}` };
+        }
+        const suggestions = j.suggestions;
+        if (!Array.isArray(suggestions) || suggestions.length !== chunkTx.length) {
+          return {
+            ok: false,
+            error: `AI returned ${Array.isArray(suggestions) ? suggestions.length : 0} suggestions for ${chunkTx.length} transactions`,
+          };
+        }
+        return { ok: true, suggestions };
+      }
+      return { ok: false, error: `AI error (HTTP ${lastStatus || 'network'}): ${lastErr}` };
+    };
+
+    try {
+      const chunks = [];
+      for (let i = 0; i < uncat.length; i += CHUNK_SIZE) chunks.push(uncat.slice(i, i + CHUNK_SIZE));
+      const totalChunks = chunks.length;
+      let processedTx = 0;
+      let totalApplied = 0;
+      let totalSuggested = 0;
+      let failedChunks = 0;
+      let firstError = '';
+
+      for (let ci = 0; ci < chunks.length; ci++) {
+        const chunk = chunks[ci];
+        setLearnStatus(`Asking Claude… (${Math.min(processedTx + chunk.length, uncat.length)}/${uncat.length})`);
+        const res = await fetchChunk(chunk);
+        if (!res.ok) {
+          failedChunks++;
+          if (!firstError) firstError = res.error || 'unknown';
+          processedTx += chunk.length;
+          continue;
+        }
+        const suggestions = res.suggestions;
+        const learnQueue = [];
+        let appliedThisChunk = 0;
+        let suggestedThisChunk = 0;
+        setTransactions(prev => {
+          const monthTxs = (prev[currentMonth] || []).slice();
+          for (let i = 0; i < chunk.length; i++) {
+            const cat = suggestions[i];
+            if (!cat || cat === 'uncategorized') continue;
+            suggestedThisChunk++;
+            const idx = monthTxs.findIndex(t => t.id === chunk[i].id);
+            if (idx >= 0 && monthTxs[idx].category !== cat) {
+              monthTxs[idx] = { ...monthTxs[idx], category: cat };
+              appliedThisChunk++;
+              learnQueue.push({ ...monthTxs[idx] });
+            }
+          }
+          return { ...prev, [currentMonth]: monthTxs };
+        });
+        // Persist learned merchant -> category and apply retroactively across months.
+        learnQueue.forEach(t => learnFromTx(t));
+        totalApplied += appliedThisChunk;
+        totalSuggested += suggestedThisChunk;
+        processedTx += chunk.length;
+      }
+
+      if (failedChunks === totalChunks && totalChunks > 0) {
+        setLearnStatus(firstError || 'AI request failed');
+      } else if (failedChunks > 0) {
+        setLearnStatus(`AI suggested ${totalApplied} categor${totalApplied === 1 ? 'y' : 'ies'} from ${uncat.length} transactions across ${totalChunks} chunks (${failedChunks} chunk${failedChunks === 1 ? '' : 's'} failed: ${firstError}).`);
+      } else {
+        setLearnStatus(`AI suggested ${totalApplied} categor${totalApplied === 1 ? 'y' : 'ies'} from ${uncat.length} transactions across ${totalChunks} chunk${totalChunks === 1 ? '' : 's'}. Review and override any that look wrong — your overrides become new rules.`);
+      }
     } catch (e) {
       setLearnStatus(`AI request failed: ${(e && e.message) || 'unknown'}`);
     } finally {

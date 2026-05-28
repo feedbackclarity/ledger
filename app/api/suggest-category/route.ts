@@ -28,8 +28,8 @@ export async function POST(req: NextRequest) {
   if (!Array.isArray(transactions) || !Array.isArray(categories) || transactions.length === 0 || categories.length === 0) {
     return NextResponse.json({ error: 'transactions and categories required' }, { status: 400 });
   }
-  if (transactions.length > 100) {
-    return NextResponse.json({ error: 'max 100 transactions per request' }, { status: 400 });
+  if (transactions.length > 30) {
+    return NextResponse.json({ error: 'max 30 transactions per request' }, { status: 400 });
   }
 
   const validIds = new Set(categories.map(c => c.id));
@@ -84,6 +84,10 @@ ${txList}`;
       usage: { input: resp.usage.input_tokens, output: resp.usage.output_tokens },
     });
   } catch (e: any) {
+    console.error('[suggest-category]', e);
     return NextResponse.json({ error: `AI call failed: ${e?.message || 'unknown'}` }, { status: 500 });
   }
 }
+// TODO: If intermittent DO App Platform 502s persist after client batching + retry,
+// open a DigitalOcean support ticket referencing app id a5563d1e-e193-4955-b180-ce5f1128bcce
+// and the via_upstream (502) failures on POST /api/suggest-category.
