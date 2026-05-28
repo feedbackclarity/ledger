@@ -394,12 +394,60 @@ export default function BudgetPlanner() {
   const [parsing, setParsing] = useState(false);
   const [loadedFileName, setLoadedFileName] = useState(null);
   const [learnStatus, setLearnStatus] = useState('');
+  const [suggesting, setSuggesting] = useState(false);
 
   useEffect(() => {
     if (!learnStatus) return;
-    const t = setTimeout(() => setLearnStatus(''), 4000);
+    const t = setTimeout(() => setLearnStatus(''), 6000);
     return () => clearTimeout(t);
   }, [learnStatus]);
+
+  const suggestCategories = async () => {
+    const uncat = (transactions[currentMonth] || []).filter(t => !t.category || t.category === 'uncategorized');
+    if (uncat.length === 0) return;
+    setSuggesting(true);
+    setLearnStatus('');
+    try {
+      const r = await fetch('/api/suggest-category', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          transactions: uncat.map(t => ({ description: t.description, amount: t.amount })),
+          categories: categories.map(c => ({ id: c.id, name: c.name })),
+        }),
+      });
+      const j = await r.json();
+      if (!r.ok) { setLearnStatus(`AI error: ${j.error || 'unknown'}`); return; }
+      const suggestions = j.suggestions;
+      if (!Array.isArray(suggestions) || suggestions.length !== uncat.length) {
+        setLearnStatus(`AI returned ${Array.isArray(suggestions) ? suggestions.length : 0} suggestions for ${uncat.length} transactions`);
+        return;
+      }
+      let applied = 0;
+      const learnQueue = [];
+      setTransactions(prev => {
+        const monthTxs = (prev[currentMonth] || []).slice();
+        for (let i = 0; i < uncat.length; i++) {
+          const cat = suggestions[i];
+          if (!cat || cat === 'uncategorized') continue;
+          const idx = monthTxs.findIndex(t => t.id === uncat[i].id);
+          if (idx >= 0 && monthTxs[idx].category !== cat) {
+            monthTxs[idx] = { ...monthTxs[idx], category: cat };
+            applied++;
+            learnQueue.push({ ...monthTxs[idx] });
+          }
+        }
+        return { ...prev, [currentMonth]: monthTxs };
+      });
+      // Persist learned merchant -> category and apply retroactively across months.
+      learnQueue.forEach(t => learnFromTx(t));
+      setLearnStatus(`AI suggested ${applied} categor${applied === 1 ? 'y' : 'ies'}. Review and override any that look wrong — your overrides become new rules.`);
+    } catch (e) {
+      setLearnStatus(`AI request failed: ${(e && e.message) || 'unknown'}`);
+    } finally {
+      setSuggesting(false);
+    }
+  };
 
   const handleFile = async (file) => {
     if (!file) return;
@@ -826,6 +874,22 @@ export default function BudgetPlanner() {
               <div style={styles.emptyState}>No transactions yet. <button style={styles.linkBtn} onClick={() => setView('import')}>Import →</button></div>
             ) : (
               <>
+                {(() => {
+                  const uncatCount = monthTx.filter(t => !t.category || t.category === 'uncategorized').length;
+                  if (uncatCount === 0) return null;
+                  return (
+                    <div style={styles.aiBar}>
+                      <span>{uncatCount} transaction{uncatCount === 1 ? '' : 's'} need a category.</span>
+                      <button
+                        style={styles.primaryBtn}
+                        onClick={suggestCategories}
+                        disabled={suggesting}
+                      >
+                        {suggesting ? 'Asking Claude…' : `✨ Suggest with AI`}
+                      </button>
+                    </div>
+                  );
+                })()}
                 <BulkActions
                   transactions={monthTx}
                   categories={categories}
@@ -1581,6 +1645,20 @@ const styles: Record<string, React.CSSProperties> = {
     background: '#eef4fb',
     border: `1px solid ${colors.accentLight}`,
     color: colors.accent,
+    fontSize: 13,
+    borderRadius: 8,
+    fontWeight: 500,
+  },
+  aiBar: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    marginBottom: 14,
+    padding: '10px 14px',
+    background: colors.amberBg,
+    border: `1px solid #fcd34d`,
+    color: colors.amber,
     fontSize: 13,
     borderRadius: 8,
     fontWeight: 500,
