@@ -68,6 +68,94 @@ const monthLabel = (key) => {
   return new Date(parseInt(y), parseInt(m) - 1, 1).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
 };
 
+// ============ STATEMENT PARSER ============
+const DATE_RE = /^\d{1,4}[-\/.]\d{1,2}[-\/.]\d{1,4}$|^\d{1,2}\/\d{1,2}$/;
+const HEADER_TOKENS = /^(date|posting|posted|trans(action)?|description|merchant|amount|debit|credit|payee|category|memo|details|ref(erence)?)/i;
+
+function parseAmount(s) {
+  if (!s) return NaN;
+  let t = String(s).trim();
+  if (!t) return NaN;
+  let neg = false;
+  if (/^\(.*\)$/.test(t)) { neg = true; t = t.slice(1, -1); }
+  if (t.endsWith('-')) { neg = true; t = t.slice(0, -1); }
+  t = t.replace(/[$£€,\s]/g, '');
+  if (!/^-?\d+(\.\d+)?$/.test(t)) return NaN;
+  const v = parseFloat(t);
+  if (isNaN(v)) return NaN;
+  return neg ? -Math.abs(v) : v;
+}
+
+function splitCsvLine(line) {
+  const out = []; let cur = ''; let q = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') { if (q && line[i+1] === '"') { cur += '"'; i++; } else { q = !q; } continue; }
+    if (c === ',' && !q) { out.push(cur.trim()); cur = ''; continue; }
+    cur += c;
+  }
+  out.push(cur.trim());
+  return out;
+}
+
+function parseStatementText(raw) {
+  const lines = (raw || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (lines.length === 0) return { tx: [], skipped: 0, error: 'Empty input' };
+
+  const sample = lines.slice(0, Math.min(10, lines.length)).join('\n');
+  const counts = {
+    tab:   (sample.match(/\t/g) || []).length,
+    comma: (sample.match(/,/g)  || []).length,
+    semi:  (sample.match(/;/g)  || []).length,
+    pipe:  (sample.match(/\|/g) || []).length,
+  };
+  const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+  let splitter;
+  if (top[1] >= lines.length) {
+    if (top[0] === 'tab')   splitter = l => l.split('\t').map(p => p.trim());
+    else if (top[0] === 'comma') splitter = l => splitCsvLine(l);
+    else if (top[0] === 'semi')  splitter = l => l.split(';').map(p => p.trim());
+    else                          splitter = l => l.split('|').map(p => p.trim());
+  } else {
+    splitter = l => l.split(/\s{2,}|\t+/).map(p => p.trim()).filter(Boolean);
+  }
+
+  let startIdx = 0;
+  const firstParts = splitter(lines[0]);
+  const hasHeaderWord = firstParts.some(p => HEADER_TOKENS.test(p));
+  const firstHasAmount = firstParts.some(p => !isNaN(parseAmount(p)) && /\d/.test(p));
+  if (hasHeaderWord && !firstHasAmount) startIdx = 1;
+
+  const tx = [];
+  let skipped = 0;
+  for (let i = startIdx; i < lines.length; i++) {
+    const parts = splitter(lines[i]);
+    if (parts.length < 2) { skipped++; continue; }
+
+    let dateIdx = -1;
+    for (let j = 0; j < parts.length; j++) {
+      if (DATE_RE.test(parts[j])) { dateIdx = j; break; }
+    }
+    let amountIdx = -1;
+    let amountVal = NaN;
+    for (let j = parts.length - 1; j >= 0; j--) {
+      const v = parseAmount(parts[j]);
+      if (!isNaN(v) && /\d/.test(parts[j])) { amountIdx = j; amountVal = v; break; }
+    }
+    if (dateIdx === -1 || amountIdx === -1 || isNaN(amountVal)) { skipped++; continue; }
+
+    const descParts = [];
+    for (let j = 0; j < parts.length; j++) {
+      if (j !== dateIdx && j !== amountIdx) descParts.push(parts[j]);
+    }
+    const description = descParts.join(' ').replace(/\s+/g, ' ').trim();
+    if (!description) { skipped++; continue; }
+
+    tx.push({ date: parts[dateIdx], description, amount: amountVal });
+  }
+  return { tx, skipped };
+}
+
 // ============ MAIN COMPONENT ============
 export default function BudgetPlanner() {
   const [loading, setLoading] = useState(true);
@@ -203,76 +291,64 @@ export default function BudgetPlanner() {
   // ============ IMPORT FLOW ============
   const [importText, setImportText] = useState('');
   const [importStatus, setImportStatus] = useState('');
+  const [isDragging, setIsDragging] = useState(false);
+  const [parsing, setParsing] = useState(false);
+  const [loadedFileName, setLoadedFileName] = useState(null);
+
+  const handleFile = async (file) => {
+    if (!file) return;
+    setParsing(true);
+    setImportStatus('');
+    setLoadedFileName(null);
+    const name = (file.name || '').toLowerCase();
+    const looksText = /\.(csv|tsv|txt)$/.test(name) || (file.type || '').startsWith('text/');
+    try {
+      if (looksText && file.size < 2 * 1024 * 1024) {
+        const text = await file.text();
+        setImportText(text);
+        setLoadedFileName(file.name);
+        setImportStatus(`Loaded ${file.name} (${(file.size/1024).toFixed(1)} KB). Review below, then Import.`);
+      } else {
+        const fd = new FormData();
+        fd.append('file', file);
+        const r = await fetch('/api/parse-statement', { method: 'POST', body: fd });
+        const j = await r.json();
+        if (!r.ok) { setImportStatus(j.error || 'Failed to parse file'); return; }
+        setImportText(j.text);
+        setLoadedFileName(file.name);
+        const detail = j.kind === 'pdf' ? `${j.pages} pages` : `${((j.text || '').length/1024).toFixed(1)} KB text`;
+        setImportStatus(`Loaded ${file.name} (${detail}). Review below, then Import.`);
+      }
+    } catch (e) {
+      setImportStatus(`Upload failed: ${(e && e.message) || 'unknown error'}`);
+    } finally {
+      setParsing(false);
+    }
+  };
 
   const handleImport = () => {
-    const lines = importText.trim().split('\n').filter(l => l.trim());
-    if (lines.length === 0) {
-      setImportStatus('No data to import');
+    const parsed = parseStatementText(importText);
+    if (parsed.tx.length === 0) {
+      setImportStatus(parsed.error || 'No transactions detected. Check format or try a different file.');
       return;
     }
-
-    const newTx = [];
-    let skipped = 0;
-
-    lines.forEach((line, idx) => {
-      // Try to parse: date, description, amount  (CSV or tab-separated)
-      const parts = line.includes('\t') ? line.split('\t') : line.split(',').map(p => p.trim().replace(/^"|"$/g, ''));
-      if (parts.length < 3) { skipped++; return; }
-
-      // Find amount (last numeric-looking field)
-      let amount = null;
-      let date = null;
-      let description = null;
-
-      for (let i = parts.length - 1; i >= 0; i--) {
-        const cleaned = parts[i].replace(/[$,\s]/g, '');
-        const n = parseFloat(cleaned);
-        if (!isNaN(n) && amount === null) {
-          amount = n;
-        } else if (amount !== null && date === null) {
-          // try date
-          if (/\d{1,4}[-/]\d{1,2}[-/]\d{1,4}/.test(parts[i])) {
-            date = parts[i];
-            description = parts.slice(0, i).concat(parts.slice(i + 1, parts.length - 1)).filter(p => p !== parts[parts.length - 1]).join(' ').trim();
-            break;
-          }
-        }
-      }
-
-      // Fallback: assume order is date, description, amount
-      if (!date || !description) {
-        date = parts[0];
-        amount = parseFloat(parts[parts.length - 1].replace(/[$,\s]/g, ''));
-        description = parts.slice(1, -1).join(' ').trim();
-      }
-
-      if (isNaN(amount) || !description) { skipped++; return; }
-
-      const category = autoCategorize(description);
-      // Heuristic: positive amounts → income/transfer; flag for review
-      let classification = null;
-      if (amount > 0) {
-        classification = 'transfer'; // user requested: mark probable income as transfers
-      } else {
-        classification = 'personal'; // default; user will mark business
-      }
-
-      newTx.push({
-        id: `${currentMonth}-${Date.now()}-${idx}`,
-        date,
-        description,
-        amount,
-        category,
-        classification,
-      });
-    });
+    const stamp = Date.now();
+    const newTx = parsed.tx.map((p, idx) => ({
+      id: `${currentMonth}-${stamp}-${idx}`,
+      date: p.date,
+      description: p.description,
+      amount: p.amount,
+      category: autoCategorize(p.description),
+      classification: p.amount > 0 ? 'transfer' : 'personal',
+    }));
 
     setTransactions(prev => ({
       ...prev,
       [currentMonth]: [...(prev[currentMonth] || []), ...newTx],
     }));
-    setImportStatus(`Imported ${newTx.length} transactions${skipped ? `, skipped ${skipped}` : ''}. Review them in Transactions.`);
+    setImportStatus(`Imported ${newTx.length} transactions${parsed.skipped ? `, skipped ${parsed.skipped}` : ''}. Review them in Transactions.`);
     setImportText('');
+    setLoadedFileName(null);
   };
 
   // ============ TX OPERATIONS ============
@@ -510,22 +586,58 @@ export default function BudgetPlanner() {
           <section style={styles.section}>
             <h2 style={styles.sectionTitle}>Import Transactions for {monthLabel(currentMonth)}</h2>
             <div style={styles.helperText}>
-              Paste CSV data from any bank/card export. Expected columns: <strong>date, description, amount</strong> (any order; comma or tab separated; with or without headers).
-              Negative amounts are spend; positive amounts are flagged as <strong>transfers</strong> (per your rule — you'll catch real income in review).
+              Drop a <strong>CSV, TSV, TXT, or PDF</strong> statement onto the box below, or click to choose a file.
+              Columns and delimiter are auto-detected. You can also paste rows directly into the textarea.
+              Negative amounts are spend; positive amounts are flagged as <strong>transfers</strong> for review.
             </div>
-            <div style={styles.helperText}>
-              For PDF statements: open the PDF, select all transactions, paste below. The parser tolerates messy formats.
+
+            <div
+              style={{
+                ...styles.dropzone,
+                ...(isDragging ? styles.dropzoneActive : {}),
+                ...(parsing ? styles.dropzoneBusy : {}),
+              }}
+              onDragOver={e => { e.preventDefault(); if (!isDragging) setIsDragging(true); }}
+              onDragLeave={() => setIsDragging(false)}
+              onDrop={e => {
+                e.preventDefault();
+                setIsDragging(false);
+                const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+                if (f) handleFile(f);
+              }}
+              onClick={() => {
+                const el = document.getElementById('statementFile');
+                if (el) el.click();
+              }}
+            >
+              <input
+                id="statementFile"
+                type="file"
+                accept=".csv,.tsv,.txt,.pdf,text/csv,text/plain,text/tab-separated-values,application/pdf"
+                style={{ display: 'none' }}
+                onChange={e => {
+                  const f = e.target.files && e.target.files[0];
+                  if (f) handleFile(f);
+                  e.currentTarget.value = '';
+                }}
+              />
+              {parsing
+                ? 'Parsing file…'
+                : loadedFileName
+                  ? `Loaded: ${loadedFileName} — drop another to replace`
+                  : 'Drag a CSV / TSV / TXT / PDF here, or click to choose a file'}
             </div>
+
             <textarea
               value={importText}
               onChange={e => setImportText(e.target.value)}
-              placeholder={`Examples:\n12/03/2025, WHOLE FOODS MARKET, -187.43\n12/04/2025, "SHELL OIL 12345", -62.10\n12/05/2025, AUTOPLICITY DIST, 45000.00`}
+              placeholder={`Or paste rows here:\n12/03/2025, WHOLE FOODS MARKET, -187.43\n12/04/2025, "SHELL OIL 12345", -62.10\n12/05/2025, AUTOPLICITY DIST, 45000.00`}
               style={styles.textarea}
-              rows={12}
+              rows={10}
             />
             <div style={styles.btnRow}>
-              <button style={styles.primaryBtn} onClick={handleImport}>Import & Auto-Categorize</button>
-              <button style={styles.secondaryBtn} onClick={() => setImportText('')}>Clear</button>
+              <button style={styles.primaryBtn} onClick={handleImport} disabled={parsing}>Import & Auto-Categorize</button>
+              <button style={styles.secondaryBtn} onClick={() => { setImportText(''); setLoadedFileName(null); setImportStatus(''); }}>Clear</button>
             </div>
             {importStatus && <div style={styles.statusMsg}>{importStatus}</div>}
           </section>
@@ -1224,6 +1336,30 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 8,
     resize: 'vertical',
     lineHeight: 1.5,
+  },
+  dropzone: {
+    width: '100%',
+    padding: '28px 16px',
+    marginBottom: 14,
+    border: `2px dashed ${colors.borderStrong}`,
+    borderRadius: 10,
+    background: colors.bgSubtle,
+    color: colors.muted,
+    textAlign: 'center',
+    cursor: 'pointer',
+    fontSize: 14,
+    fontWeight: 500,
+    transition: 'background 120ms, border-color 120ms, color 120ms',
+    userSelect: 'none',
+  },
+  dropzoneActive: {
+    background: '#eef4fb',
+    borderColor: colors.accentLight,
+    color: colors.accent,
+  },
+  dropzoneBusy: {
+    cursor: 'progress',
+    opacity: 0.7,
   },
   btnRow: {
     display: 'flex',
