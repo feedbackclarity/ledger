@@ -35,20 +35,80 @@ const DEFAULT_CATEGORIES = [
 
 // ============ CATEGORIZATION RULES (LEARNED PATTERNS) ============
 const SEED_RULES = [
-  { pattern: /shell|chevron|bp |mobil|exxon|gas station|76 /i, category: 'auto' },
-  { pattern: /state farm|geico|progressive auto/i, category: 'auto' },
-  { pattern: /jiffy lube|valvoline|midas|firestone/i, category: 'auto' },
-  { pattern: /whole foods|trader joe|jewel|mariano|costco|wegman/i, category: 'groceries' },
-  { pattern: /amazon fresh|instacart|gopuff/i, category: 'groceries' },
-  { pattern: /netflix|spotify|hulu|apple\.com\/bill|prime video/i, category: 'subscriptions' },
-  { pattern: /ypo/i, category: 'subscriptions' },
-  { pattern: /comed|peoples gas|att|verizon|comcast|xfinity/i, category: 'home-chicago-utilities' },
-  { pattern: /walgreens|cvs|pharmacy|doctor|dental|equinox|peloton/i, category: 'health' },
-  { pattern: /united|delta|american airlines|hotel|airbnb|hyatt|marriott|hilton/i, category: 'travel' },
-  { pattern: /uber|lyft|taxi/i, category: 'travel' },
-  { pattern: /resy|opentable|tock/i, category: 'restaurants' },
-  { pattern: /irs|illinois dept of rev|estimated tax/i, category: 'taxes-quarterly' },
+  { pattern: /shell|chevron|\bbp\b|mobil|exxon|gas station|\b76\b|sunoco|valero|marathon/i, category: 'auto' },
+  { pattern: /state farm|geico|progressive auto|allstate|liberty mutual/i, category: 'auto' },
+  { pattern: /jiffy lube|valvoline|midas|firestone|pep boys|autozone|napa auto/i, category: 'auto' },
+  { pattern: /whole foods|trader joe|jewel|mariano|costco|wegman|safeway|kroger|publix|aldi|sprouts|fresh market/i, category: 'groceries' },
+  { pattern: /amazon fresh|instacart|gopuff|fresh direct|shipt/i, category: 'groceries' },
+  { pattern: /netflix|spotify|hulu|apple\.com\/bill|itunes|prime video|disney plus|hbo max|paramount|peacock|youtube premium/i, category: 'subscriptions' },
+  { pattern: /audible|kindle unlimited|nytimes|new york times|wsj|wall street journal|washington post|economist/i, category: 'subscriptions' },
+  { pattern: /squarespace|sqsp\*|wix|wordpress|godaddy|namecheap|cloudflare/i, category: 'subscriptions' },
+  { pattern: /substack|patreon|onlyfans/i, category: 'subscriptions' },
+  { pattern: /adobe|chatgpt|openai|anthropic|github|linear|notion|figma|claude\.ai|cursor|jetbrains/i, category: 'subscriptions' },
+  { pattern: /icloud|dropbox|google storage|google one|microsoft 365|m365/i, category: 'subscriptions' },
+  { pattern: /ypo|young presidents|eo global|vistage/i, category: 'subscriptions' },
+  { pattern: /comed|peoples gas|nicor|\batt\b|verizon|comcast|xfinity|t-mobile|sprint|spectrum/i, category: 'home-chicago-utilities' },
+  { pattern: /walgreens|cvs|rite aid|pharmacy|doctor|dental|orthodonti|equinox|peloton|soulcycle|barry'?s|orange.?theory/i, category: 'health' },
+  { pattern: /united|delta|american airlines|southwest|jetblue|alaska air|frontier|spirit airlines|lufthansa|british airways|air france|emirates/i, category: 'travel' },
+  { pattern: /hotel|airbnb|hyatt|marriott|hilton|four seasons|ritz.?carlton|holiday inn|sheraton|westin|kimpton|vrbo/i, category: 'travel' },
+  { pattern: /uber|lyft|taxi|ubers? eats|doordash|grubhub|seamless|caviar/i, category: 'travel' },
+  { pattern: /starbucks|dunkin|peet'?s|blue bottle|philz|la colombe|intelligentsia|stumptown/i, category: 'restaurants' },
+  { pattern: /mcdonald|chipotle|sweetgreen|chick.?fil|panera|domino|pizza|sushi|ramen|thai/i, category: 'restaurants' },
+  { pattern: /resy|opentable|tock|yelp reservations/i, category: 'restaurants' },
+  { pattern: /irs|illinois dept of rev|estimated tax|franchise tax|state tax/i, category: 'taxes-quarterly' },
 ];
+
+// Payment-system / network noise that should be stripped before matching:
+// "AplPay UBER TRIP" → "UBER TRIP", "TST* MERCHANT" → "MERCHANT", etc.
+const MERCHANT_PREFIX_RE = /^(aplpay|applepay|apple pay|gpay|google pay|tst\*|sq \*|sq\*|paypal \*|pp\*|amzn mktp|amzn mkt|amazon\.com|venmo|cash app|cashapp|zelle to|zelle from|payment to|payment from)\s*/i;
+const URL_RE = /\s+https?:\S+/i;
+const TX_ID_RE = /#\d{2,}.*$/;
+const TRAIL_STATE_RE = /\s+[A-Z]{2}\s*$/;
+
+function normalizeMerchant(description) {
+  let s = String(description || '').trim();
+  // Repeated prefix strip so "AplPay SQ* MERCHANT" peels both layers
+  let prev = '';
+  while (s !== prev && MERCHANT_PREFIX_RE.test(s)) { prev = s; s = s.replace(MERCHANT_PREFIX_RE, '').trim(); }
+  s = s.replace(URL_RE, '');
+  s = s.replace(TX_ID_RE, '');
+  s = s.replace(TRAIL_STATE_RE, '');
+  s = s.replace(/\s{2,}/g, ' ').trim();
+  return s;
+}
+
+function merchantKey(description) {
+  const norm = normalizeMerchant(description);
+  if (norm.length < 3) return null;
+  // First 2 tokens, lowercased — stable enough that "UBER TRIP HTTPS://..." and "UBER EATS NEW YORK" share "uber"
+  const tokens = norm.split(/\s+/).filter(t => t.length > 0).slice(0, 2).join(' ').toLowerCase();
+  return tokens.length >= 3 ? tokens : null;
+}
+
+const INCOME_KW_RE = /\b(payroll|salary|direct dep(osit)?|deposit from|interest paid|interest earned|dividend|refund|reimbursement|tax refund|rebate)\b/i;
+const TRANSFER_KW_RE = /\b(payment\s*-?\s*thank|autopay|online payment|transfer (to|from)|xfer|wire (to|from)|ach (debit|credit|transfer|from|to)|internal transfer|account transfer)\b/i;
+
+function classifyAmount(amount, description, convention) {
+  if (INCOME_KW_RE.test(description)) return 'income';
+  if (TRANSFER_KW_RE.test(description)) return 'transfer';
+  if (convention === 'credit-card') {
+    // CC: positive = charge (spend), negative = payment received from your bank
+    return amount > 0 ? 'personal' : 'transfer';
+  }
+  // Bank: negative = spend, positive = transfer in / income
+  if (amount > 0) {
+    // Large round-ish positives are more likely income than internal transfer, but
+    // without more signal we keep them as 'transfer' for user review.
+    return 'transfer';
+  }
+  return 'personal';
+}
+
+function detectSignConvention(parsed) {
+  if (!parsed.length) return 'bank';
+  const pos = parsed.filter(t => t.amount > 0).length;
+  return pos / parsed.length >= 0.6 ? 'credit-card' : 'bank';
+}
 
 // ============ HELPERS ============
 const fmt = (n) => {
@@ -301,18 +361,30 @@ export default function BudgetPlanner() {
   }, [transactions]);
 
   // ============ CATEGORIZATION ============
-  const autoCategorize = (description) => {
-    // Check learned rules first
+  const lookupRule = (description) => {
+    const norm = normalizeMerchant(description).toLowerCase();
+    const raw = String(description || '').toLowerCase();
     for (const rule of rules) {
-      if (description.toLowerCase().includes(rule.merchant.toLowerCase())) {
-        return rule.category;
-      }
+      const m = (rule.merchant || '').toLowerCase();
+      if (!m) continue;
+      if (norm.includes(m) || raw.includes(m)) return rule;
     }
-    // Fall back to seed rules
+    return null;
+  };
+
+  const autoCategorize = (description) => {
+    const learned = lookupRule(description);
+    if (learned && learned.category && learned.category !== 'uncategorized') return learned.category;
+    const norm = normalizeMerchant(description);
     for (const rule of SEED_RULES) {
-      if (rule.pattern.test(description)) return rule.category;
+      if (rule.pattern.test(description) || rule.pattern.test(norm)) return rule.category;
     }
     return 'uncategorized';
+  };
+
+  const lookupLearnedClass = (description) => {
+    const learned = lookupRule(description);
+    return learned && learned.classification ? learned.classification : null;
   };
 
   // ============ IMPORT FLOW ============
@@ -321,6 +393,13 @@ export default function BudgetPlanner() {
   const [isDragging, setIsDragging] = useState(false);
   const [parsing, setParsing] = useState(false);
   const [loadedFileName, setLoadedFileName] = useState(null);
+  const [learnStatus, setLearnStatus] = useState('');
+
+  useEffect(() => {
+    if (!learnStatus) return;
+    const t = setTimeout(() => setLearnStatus(''), 4000);
+    return () => clearTimeout(t);
+  }, [learnStatus]);
 
   const handleFile = async (file) => {
     if (!file) return;
@@ -359,21 +438,26 @@ export default function BudgetPlanner() {
       setImportStatus(parsed.error || 'No transactions detected. Check format or try a different file.');
       return;
     }
+    const convention = detectSignConvention(parsed.tx);
     const stamp = Date.now();
-    const newTx = parsed.tx.map((p, idx) => ({
-      id: `${currentMonth}-${stamp}-${idx}`,
-      date: p.date,
-      description: p.description,
-      amount: p.amount,
-      category: autoCategorize(p.description),
-      classification: p.amount > 0 ? 'transfer' : 'personal',
-    }));
+    const newTx = parsed.tx.map((p, idx) => {
+      const learnedClass = lookupLearnedClass(p.description);
+      return {
+        id: `${currentMonth}-${stamp}-${idx}`,
+        date: p.date,
+        description: p.description,
+        amount: p.amount,
+        category: autoCategorize(p.description),
+        classification: learnedClass || classifyAmount(p.amount, p.description, convention),
+      };
+    });
 
     setTransactions(prev => ({
       ...prev,
       [currentMonth]: [...(prev[currentMonth] || []), ...newTx],
     }));
-    setImportStatus(`Imported ${newTx.length} transactions${parsed.skipped ? `, skipped ${parsed.skipped}` : ''}. Review them in Transactions.`);
+    const kind = convention === 'credit-card' ? 'credit-card export' : 'bank export';
+    setImportStatus(`Imported ${newTx.length} transactions${parsed.skipped ? `, skipped ${parsed.skipped}` : ''}. Detected ${kind}; review in Transactions.`);
     setImportText('');
     setLoadedFileName(null);
   };
@@ -387,14 +471,55 @@ export default function BudgetPlanner() {
   };
 
   const learnFromTx = (tx) => {
-    if (!tx.category || tx.category === 'uncategorized') return;
-    // Extract a merchant token: first 2-3 words of description
-    const tokens = tx.description.split(/\s+/).slice(0, 2).join(' ');
-    if (tokens.length < 3) return;
+    const key = merchantKey(tx.description);
+    if (!key) return;
+    const hasCategory = tx.category && tx.category !== 'uncategorized';
+    const hasClass = !!tx.classification;
+    if (!hasCategory && !hasClass) return;
+
     setRules(prev => {
-      const exists = prev.find(r => r.merchant.toLowerCase() === tokens.toLowerCase());
-      if (exists) return prev.map(r => r.merchant.toLowerCase() === tokens.toLowerCase() ? { ...r, category: tx.category } : r);
-      return [...prev, { merchant: tokens, category: tx.category }];
+      const idx = prev.findIndex(r => (r.merchant || '').toLowerCase() === key);
+      if (idx >= 0) {
+        const next = prev.slice();
+        next[idx] = {
+          ...prev[idx],
+          category: hasCategory ? tx.category : prev[idx].category,
+          classification: hasClass ? tx.classification : prev[idx].classification,
+        };
+        return next;
+      }
+      return [...prev, {
+        merchant: key,
+        category: hasCategory ? tx.category : 'uncategorized',
+        ...(hasClass ? { classification: tx.classification } : {}),
+      }];
+    });
+
+    // Retroactive apply across every month, except the just-edited row.
+    setTransactions(prev => {
+      const next = {};
+      let updated = 0;
+      for (const mk of Object.keys(prev)) {
+        next[mk] = (prev[mk] || []).map(t => {
+          if (t.id === tx.id) return t;
+          const tKey = merchantKey(t.description);
+          if (tKey !== key) return t;
+          let patched = t;
+          if (hasCategory && t.category !== tx.category) {
+            patched = { ...patched, category: tx.category };
+            updated++;
+          }
+          if (hasClass && t.classification !== tx.classification) {
+            patched = { ...patched, classification: tx.classification };
+            if (patched === t) updated++;
+          }
+          return patched;
+        });
+      }
+      if (updated > 0) {
+        setLearnStatus(`Applied ${hasCategory ? 'category' : ''}${hasCategory && hasClass ? ' + ' : ''}${hasClass ? 'class' : ''} to ${updated} matching transaction${updated === 1 ? '' : 's'}.`);
+      }
+      return next;
     });
   };
 
@@ -694,6 +819,7 @@ export default function BudgetPlanner() {
       {/* ============ TRANSACTIONS ============ */}
       {view === 'transactions' && (
         <div>
+          {learnStatus && <div style={styles.learnToast}>{learnStatus}</div>}
           <section style={styles.section}>
             <h2 style={styles.sectionTitle}>Transactions — {monthLabel(currentMonth)}</h2>
             {monthTx.length === 0 ? (
@@ -733,7 +859,11 @@ export default function BudgetPlanner() {
                       <div style={{flex: '0 0 130px'}}>
                         <select
                           value={tx.classification || ''}
-                          onChange={e => updateTx(tx.id, { classification: e.target.value })}
+                          onChange={e => {
+                            const v = e.target.value;
+                            updateTx(tx.id, { classification: v });
+                            if (v) learnFromTx({ ...tx, classification: v });
+                          }}
                           style={styles.selectSm}
                         >
                           <option value="">— select —</option>
@@ -1444,6 +1574,16 @@ const styles: Record<string, React.CSSProperties> = {
     color: colors.red,
     fontSize: 13,
     borderRadius: 8,
+  },
+  learnToast: {
+    margin: '0 0 16px',
+    padding: '10px 14px',
+    background: '#eef4fb',
+    border: `1px solid ${colors.accentLight}`,
+    color: colors.accent,
+    fontSize: 13,
+    borderRadius: 8,
+    fontWeight: 500,
   },
   emptyState: {
     padding: 40,
