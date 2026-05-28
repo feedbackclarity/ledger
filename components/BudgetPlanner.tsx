@@ -70,7 +70,7 @@ const monthLabel = (key) => {
 
 // ============ STATEMENT PARSER ============
 const DATE_RE = /^\d{1,4}[-\/.]\d{1,2}[-\/.]\d{1,4}$|^\d{1,2}\/\d{1,2}$/;
-const HEADER_TOKENS = /^(date|posting|posted|trans(action)?|description|merchant|amount|debit|credit|payee|category|memo|details|ref(erence)?)/i;
+const HEADER_TOKENS = /\b(date|posting|posted|trans(action)?|description|merchant|amount|debit|credit|withdrawal|deposit|balance|statement|notes|payee|category|memo|details|ref(erence)?)\b/i;
 
 function parseAmount(s) {
   if (!s) return NaN;
@@ -99,10 +99,12 @@ function splitCsvLine(line) {
 }
 
 function parseStatementText(raw) {
-  const lines = (raw || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  raw = (raw || '').replace(/^﻿/, '');
+  const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
   if (lines.length === 0) return { tx: [], skipped: 0, error: 'Empty input' };
 
-  const sample = lines.slice(0, Math.min(10, lines.length)).join('\n');
+  const sampleLineCount = Math.min(10, lines.length);
+  const sample = lines.slice(0, sampleLineCount).join('\n');
   const counts = {
     tab:   (sample.match(/\t/g) || []).length,
     comma: (sample.match(/,/g)  || []).length,
@@ -111,7 +113,7 @@ function parseStatementText(raw) {
   };
   const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
   let splitter;
-  if (top[1] >= lines.length) {
+  if (top[1] >= sampleLineCount) {
     if (top[0] === 'tab')   splitter = l => l.split('\t').map(p => p.trim());
     else if (top[0] === 'comma') splitter = l => splitCsvLine(l);
     else if (top[0] === 'semi')  splitter = l => l.split(';').map(p => p.trim());
@@ -126,11 +128,31 @@ function parseStatementText(raw) {
   const firstHasAmount = firstParts.some(p => !isNaN(parseAmount(p)) && /\d/.test(p));
   if (hasHeaderWord && !firstHasAmount) startIdx = 1;
 
+  // TODO(H3): when header has both Withdrawal/Debit and Deposit/Credit, record
+  // their column indices and negate the debit column instead of letting the
+  // rightmost numeric win. Deferred for follow-up.
+
+  // H1 fallback: peel a leading date + trailing amount out of a single line.
+  // Used when the splitter leaves <2 parts or when date/amount detection fails.
+  const tryRowFallback = (line) => {
+    const m = line.match(/^(\d{1,4}[-\/.]\d{1,2}(?:[-\/.]\d{1,4})?)\s+(.*?)\s+(\(?[\$£€]?\-?[\d,]+\.\d{2}\)?\-?)$/);
+    if (!m) return null;
+    const amt = parseAmount(m[3]);
+    const desc = m[2].trim();
+    if (isNaN(amt) || !desc) return null;
+    return { date: m[1], description: desc, amount: amt };
+  };
+
   const tx = [];
   let skipped = 0;
   for (let i = startIdx; i < lines.length; i++) {
-    const parts = splitter(lines[i]);
-    if (parts.length < 2) { skipped++; continue; }
+    let parts = splitter(lines[i]);
+    if (parts.length < 2) {
+      const row = tryRowFallback(lines[i]);
+      if (row) { tx.push(row); continue; }
+      skipped++;
+      continue;
+    }
 
     let dateIdx = -1;
     for (let j = 0; j < parts.length; j++) {
@@ -142,7 +164,12 @@ function parseStatementText(raw) {
       const v = parseAmount(parts[j]);
       if (!isNaN(v) && /\d/.test(parts[j])) { amountIdx = j; amountVal = v; break; }
     }
-    if (dateIdx === -1 || amountIdx === -1 || isNaN(amountVal)) { skipped++; continue; }
+    if (dateIdx === -1 || amountIdx === -1 || isNaN(amountVal)) {
+      const row = tryRowFallback(lines[i]);
+      if (row) { tx.push(row); continue; }
+      skipped++;
+      continue;
+    }
 
     const descParts = [];
     for (let j = 0; j < parts.length; j++) {
@@ -639,7 +666,9 @@ export default function BudgetPlanner() {
               <button style={styles.primaryBtn} onClick={handleImport} disabled={parsing}>Import & Auto-Categorize</button>
               <button style={styles.secondaryBtn} onClick={() => { setImportText(''); setLoadedFileName(null); setImportStatus(''); }}>Clear</button>
             </div>
-            {importStatus && <div style={styles.statusMsg}>{importStatus}</div>}
+            {importStatus && (
+              <div style={/^(no transactions|upload failed|failed to|unsupported|file too large)/i.test(importStatus) ? styles.statusMsgError : styles.statusMsg}>{importStatus}</div>
+            )}
           </section>
 
           <section style={styles.section}>
@@ -1404,6 +1433,15 @@ const styles: Record<string, React.CSSProperties> = {
     background: colors.greenBg,
     border: `1px solid #a7f3d0`,
     color: '#065f46',
+    fontSize: 13,
+    borderRadius: 8,
+  },
+  statusMsgError: {
+    marginTop: 14,
+    padding: 12,
+    background: colors.redBg,
+    border: `1px solid #fecaca`,
+    color: colors.red,
     fontSize: 13,
     borderRadius: 8,
   },
