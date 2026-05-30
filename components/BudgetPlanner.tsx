@@ -265,18 +265,22 @@ export default function BudgetPlanner() {
     theme: 'light', // 'light' | 'dark'
   });
   const [importLog, setImportLog] = useState([]); // [{id,timestamp,fileName,fileSize,kind,accountId,monthKey,txCount,skippedCount,sumAmounts,convention,txIds}]
+  const [snapshots, setSnapshots] = useState([]); // [{date: 'YYYY-MM-DD', takenAt}]
+  const [snapshotTodayChecked, setSnapshotTodayChecked] = useState(false);
+  const [restoreBanner, setRestoreBanner] = useState(null); // { txCount, ts } or null
 
   // Load from storage on mount
   useEffect(() => {
     (async () => {
       try {
-        const [catsRes, rulesRes, txRes, incRes, setRes, logRes] = await Promise.all([
+        const [catsRes, rulesRes, txRes, incRes, setRes, logRes, snapIdxRes] = await Promise.all([
           window.storage.get('categories').catch(() => null),
           window.storage.get('rules').catch(() => null),
           window.storage.get('transactions').catch(() => null),
           window.storage.get('income').catch(() => null),
           window.storage.get('settings').catch(() => null),
           window.storage.get('importLog').catch(() => null),
+          window.storage.get('snapshotIndex').catch(() => null),
         ]);
         if (catsRes) setCategories(JSON.parse(catsRes.value));
         if (rulesRes) setRules(JSON.parse(rulesRes.value));
@@ -293,6 +297,7 @@ export default function BudgetPlanner() {
           });
         }
         if (logRes) setImportLog(JSON.parse(logRes.value));
+        if (snapIdxRes) setSnapshots(JSON.parse(snapIdxRes.value));
       } catch (e) {
         console.log('First run or storage error', e);
       }
@@ -331,6 +336,130 @@ export default function BudgetPlanner() {
     window.storage.set('importLog', JSON.stringify(importLog)).catch(console.error);
   }, [importLog, loading]);
 
+  // ============ BACKUP / RESTORE / SNAPSHOTS ============
+  const todayKey = () => new Date().toISOString().slice(0, 10);
+
+  const buildSnapshot = () => ({
+    categories, rules, transactions, income, settings, importLog, takenAt: Date.now(),
+  });
+
+  const applySnapshot = (data) => {
+    if (data.categories) setCategories(data.categories);
+    if (data.rules) setRules(data.rules);
+    if (data.transactions) setTransactions(data.transactions);
+    if (data.income) setIncome(data.income);
+    if (data.settings) {
+      const s = data.settings;
+      setSettings({
+        cushionTarget: s.cushionTarget || 0,
+        cushionCurrent: s.cushionCurrent || 0,
+        taxSetasidePct: s.taxSetasidePct ?? 30,
+        newportActive: !!s.newportActive,
+        accounts: s.accounts || [],
+        appName: s.appName || 'Ledger',
+        theme: s.theme === 'dark' ? 'dark' : 'light',
+      });
+    }
+    if (data.importLog) setImportLog(data.importLog);
+  };
+
+  const takeSnapshot = async (date) => {
+    const d = date || todayKey();
+    const payload = buildSnapshot();
+    try {
+      await window.storage.set(`snapshot:${d}`, JSON.stringify(payload));
+    } catch (e) { console.error('snapshot save failed', e); return; }
+    setSnapshots(prev => {
+      const without = prev.filter(s => s.date !== d);
+      const next = [{ date: d, takenAt: Date.now() }, ...without].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 30);
+      window.storage.set('snapshotIndex', JSON.stringify(next)).catch(console.error);
+      // Prune snapshots beyond the 30-day window
+      const keepSet = new Set(next.map(s => s.date));
+      prev.forEach(s => { if (!keepSet.has(s.date)) window.storage.delete?.(`snapshot:${s.date}`).catch(() => {}); });
+      return next;
+    });
+  };
+
+  const restoreSnapshot = async (date) => {
+    if (!confirm(`Restore your data to the ${date} snapshot? Your current state will be replaced.`)) return;
+    try {
+      const res = await window.storage.get(`snapshot:${date}`);
+      if (!res) { alert('Snapshot not found.'); return; }
+      applySnapshot(JSON.parse(res.value));
+    } catch (e) {
+      alert('Restore failed: ' + ((e && e.message) || 'unknown'));
+    }
+  };
+
+  // Mirror full state into the browser's localStorage on every change. If the
+  // server kv is ever wiped (a redeploy on the basic-xxs tier where DATA_DIR
+  // is ephemeral), the user can restore from this mirror.
+  useEffect(() => {
+    if (loading) return;
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    try {
+      const mirror = { categories, rules, transactions, income, settings, importLog, ts: Date.now(), v: 1 };
+      window.localStorage.setItem('ledger:mirror', JSON.stringify(mirror));
+    } catch { /* quota or private mode — skip */ }
+  }, [categories, rules, transactions, income, settings, importLog, loading]);
+
+  // Surface a restore banner when the server has empty data but localStorage
+  // has a non-empty mirror — typical "the redeploy wiped me" recovery case.
+  useEffect(() => {
+    if (loading) return;
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    const hasServer =
+      Object.keys(transactions || {}).length > 0 ||
+      Object.keys(income || {}).length > 0 ||
+      importLog.length > 0 ||
+      rules.length > 0;
+    if (hasServer) { setRestoreBanner(null); return; }
+    try {
+      const raw = window.localStorage.getItem('ledger:mirror');
+      if (!raw) return;
+      const m = JSON.parse(raw);
+      const txCount = Object.values(m.transactions || {}).reduce((s: number, arr: any) => s + (Array.isArray(arr) ? arr.length : 0), 0);
+      if (txCount === 0 && (!m.importLog || m.importLog.length === 0)) return;
+      setRestoreBanner({ txCount, ts: m.ts });
+    } catch { /* corrupt mirror */ }
+  }, [loading, transactions, income, importLog, rules]);
+
+  const restoreFromLocal = () => {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    if (!confirm("Restore your data from this browser's local backup? Current state will be replaced.")) return;
+    try {
+      const raw = window.localStorage.getItem('ledger:mirror');
+      if (!raw) { alert('No local backup found.'); return; }
+      applySnapshot(JSON.parse(raw));
+      setRestoreBanner(null);
+    } catch (e) {
+      alert('Local restore failed: ' + ((e && e.message) || 'unknown'));
+    }
+  };
+
+  // Take one snapshot per calendar day, the first time the app loads that day.
+  useEffect(() => {
+    if (loading) return;
+    if (snapshotTodayChecked) return;
+    const today = todayKey();
+    if (snapshots.some(s => s.date === today)) {
+      setSnapshotTodayChecked(true);
+      return;
+    }
+    // Skip auto-snapshot if there's literally no data to save (empty first run).
+    const empty =
+      Object.keys(transactions).length === 0 &&
+      Object.keys(income).length === 0 &&
+      importLog.length === 0 &&
+      rules.length === 0;
+    if (empty) {
+      setSnapshotTodayChecked(true);
+      return;
+    }
+    takeSnapshot(today);
+    setSnapshotTodayChecked(true);
+  }, [loading, snapshots, snapshotTodayChecked, transactions, income, importLog, rules]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Apply theme to <html data-theme> so the CSS variables switch globally.
   useEffect(() => {
     if (typeof document === 'undefined') return;
@@ -344,6 +473,21 @@ export default function BudgetPlanner() {
   }, [settings.appName]);
 
   // ============ DERIVED STATE ============
+  const monthOptions = useMemo(() => {
+    const now = new Date();
+    const set = new Set();
+    // 36 months back from today (3 years)
+    for (let i = 0; i < 36; i++) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      set.add(monthKey(d));
+    }
+    // Plus the currently-selected month and anything else that has data.
+    set.add(currentMonth);
+    Object.keys(transactions).forEach(m => set.add(m));
+    Object.keys(income).forEach(m => set.add(m));
+    return Array.from(set).sort().reverse() as string[];
+  }, [transactions, income, currentMonth]);
+
   const monthTx = transactions[currentMonth] || [];
   const monthIncome = income[currentMonth] || 0;
   const taxReserve = monthIncome * (settings.taxSetasidePct / 100);
@@ -679,7 +823,24 @@ export default function BudgetPlanner() {
     }
     const convention = detectSignConvention(parsed.tx);
     const stamp = Date.now();
-    const newTx = parsed.tx.map((p, idx) => {
+
+    // De-duplicate against existing transactions for THIS month.
+    // A duplicate has the same date, description, and amount (within $0.005).
+    // Keep the original — discard the incoming duplicate so we don't overwrite
+    // any classification or category edits the user already made.
+    const existing = transactions[currentMonth] || [];
+    const dupKey = (t) => `${(t.date || '').trim()}|${(t.description || '').trim().toLowerCase()}|${Math.round((t.amount || 0) * 100)}`;
+    const seenKeys = new Set(existing.map(dupKey));
+    const filtered = [];
+    let duplicatesSkipped = 0;
+    parsed.tx.forEach((p) => {
+      const k = dupKey(p);
+      if (seenKeys.has(k)) { duplicatesSkipped++; return; }
+      seenKeys.add(k);
+      filtered.push(p);
+    });
+
+    const newTx = filtered.map((p, idx) => {
       const learnedClass = lookupLearnedClass(p.description);
       return {
         id: `${currentMonth}-${stamp}-${idx}`,
@@ -709,6 +870,7 @@ export default function BudgetPlanner() {
       monthKey: currentMonth,
       txCount: newTx.length,
       skippedCount: parsed.skipped || 0,
+      duplicatesSkipped,
       sumAmounts,
       convention,
       txIds: newTx.map(t => t.id),
@@ -718,7 +880,8 @@ export default function BudgetPlanner() {
     const acctName = (settings.accounts || []).find(a => a.id === importAccountId)?.name;
     const acctNote = acctName ? ` from ${acctName}` : '';
     const kind = convention === 'credit-card' ? 'credit-card export' : 'bank export';
-    setImportStatus(`Imported ${newTx.length} transactions${parsed.skipped ? `, skipped ${parsed.skipped}` : ''}${acctNote}. Detected ${kind}; review in Transactions.`);
+    const dupNote = duplicatesSkipped ? `, ${duplicatesSkipped} duplicate${duplicatesSkipped === 1 ? '' : 's'} skipped` : '';
+    setImportStatus(`Imported ${newTx.length} transactions${parsed.skipped ? `, skipped ${parsed.skipped}` : ''}${dupNote}${acctNote}. Detected ${kind}; review in Transactions.`);
     setImportText('');
     setLoadedFileName(null);
     setPendingFile(null);
@@ -801,6 +964,20 @@ export default function BudgetPlanner() {
     <div style={styles.app}>
       <style>{globalCss}</style>
 
+      {restoreBanner && (
+        <div style={styles.restoreBanner}>
+          <div>
+            <strong>Server data looks empty</strong>, but this browser has a local backup with{' '}
+            <strong>{restoreBanner.txCount} transactions</strong>, last saved{' '}
+            {new Date(restoreBanner.ts).toLocaleString()}. Restore it?
+          </div>
+          <div style={{display: 'flex', gap: 8}}>
+            <button style={styles.primaryBtn} onClick={restoreFromLocal}>Restore from browser</button>
+            <button style={styles.secondaryBtn} onClick={() => setRestoreBanner(null)}>Dismiss</button>
+          </div>
+        </div>
+      )}
+
       {/* HEADER */}
       <header style={styles.header}>
         <div>
@@ -808,17 +985,16 @@ export default function BudgetPlanner() {
           <div style={styles.brandKicker}>Personal Financial Operations</div>
         </div>
         <div style={styles.monthPicker}>
-          <button style={styles.iconBtn} onClick={() => {
-            const [y, m] = currentMonth.split('-').map(Number);
-            const d = new Date(y, m - 2, 1);
-            setCurrentMonth(monthKey(d));
-          }}>‹</button>
-          <div style={styles.monthLabel}>{monthLabel(currentMonth)}</div>
-          <button style={styles.iconBtn} onClick={() => {
-            const [y, m] = currentMonth.split('-').map(Number);
-            const d = new Date(y, m, 1);
-            setCurrentMonth(monthKey(d));
-          }}>›</button>
+          <select
+            value={currentMonth}
+            onChange={e => setCurrentMonth(e.target.value)}
+            style={styles.monthSelect}
+            aria-label="Select month"
+          >
+            {monthOptions.map(m => (
+              <option key={m} value={m}>{monthLabel(m)}</option>
+            ))}
+          </select>
         </div>
       </header>
 
@@ -1672,6 +1848,43 @@ export default function BudgetPlanner() {
           </section>
 
           <section style={styles.section}>
+            <h2 style={styles.sectionTitle}>Backup &amp; Restore</h2>
+            <div style={styles.helperText}>
+              The app auto-snapshots once per day and keeps the last 30 days. Every change
+              also mirrors to your browser's local storage as a safety net against server
+              wipes. Pick any date to roll the whole app back.
+            </div>
+            <div style={{...styles.btnRow, marginBottom: 14}}>
+              <button style={styles.secondaryBtn} onClick={() => takeSnapshot(todayKey())}>
+                Take snapshot now
+              </button>
+              {typeof window !== 'undefined' && window.localStorage && window.localStorage.getItem('ledger:mirror') && (
+                <button style={styles.secondaryBtn} onClick={restoreFromLocal}>
+                  Restore from browser backup
+                </button>
+              )}
+            </div>
+            {snapshots.length === 0 ? (
+              <div style={styles.emptyState}>No snapshots yet. One will be taken automatically on next data change.</div>
+            ) : (
+              <div style={styles.rulesTable}>
+                <div style={{...styles.ruleRow, fontWeight: 600, color: colors.muted, fontSize: 12, textTransform: 'uppercase', letterSpacing: 0.4}}>
+                  <span style={{flex: '0 0 130px'}}>Date</span>
+                  <span style={{flex: 1}}>Taken</span>
+                  <span style={{flex: '0 0 90px', textAlign: 'right'}}>Action</span>
+                </div>
+                {snapshots.map((s) => (
+                  <div key={s.date} style={styles.ruleRow}>
+                    <span style={{flex: '0 0 130px', fontFamily: 'monospace', fontSize: 13}}>{s.date}</span>
+                    <span style={{flex: 1, color: colors.muted, fontSize: 12}}>{new Date(s.takenAt).toLocaleString()}</span>
+                    <button style={{...styles.linkBtn, flex: '0 0 90px', textAlign: 'right'}} onClick={() => restoreSnapshot(s.date)}>Restore</button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+
+          <section style={styles.section}>
             <h2 style={styles.sectionTitle}>Data</h2>
             <div style={styles.btnRow}>
               <button style={styles.secondaryBtn} onClick={() => {
@@ -1875,6 +2088,17 @@ const styles: Record<string, React.CSSProperties> = {
     padding: '4px',
     border: `1px solid ${colors.border}`,
     borderRadius: 8,
+  },
+  monthSelect: {
+    border: 'none',
+    background: 'transparent',
+    color: colors.text,
+    fontSize: 14,
+    fontWeight: 600,
+    padding: '6px 10px',
+    minWidth: 180,
+    cursor: 'pointer',
+    borderRadius: 6,
   },
   iconBtn: {
     background: 'transparent',
@@ -2266,6 +2490,17 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 13,
     borderRadius: 8,
     fontWeight: 500,
+  },
+  restoreBanner: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 16,
+    padding: '14px 20px',
+    background: colors.amberBg,
+    borderBottom: `1px solid #fcd34d`,
+    color: colors.amber,
+    fontSize: 14,
   },
   insightCard: {
     padding: '12px 14px',
