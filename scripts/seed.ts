@@ -21,13 +21,15 @@ if (!fs.existsSync(file)) {
 const raw = fs.readFileSync(file, 'utf8');
 const data = JSON.parse(raw);
 
-const keys = ['categories', 'rules', 'transactions', 'income', 'settings'];
-let count = 0;
-for (const key of keys) {
-  if (data[key] !== undefined) {
-    kvSet(key, JSON.stringify(data[key]));
-    count++;
-    console.log(`✓ Imported ${key}`);
+(async () => {
+  const keys = ['categories', 'rules', 'transactions', 'income', 'settings', 'importLog', 'snapshotIndex'];
+  let count = 0;
+  for (const key of keys) {
+    if (data[key] !== undefined) {
+      await kvSet(key, JSON.stringify(data[key]));
+      count++;
+      console.log(`✓ Imported ${key}`);
+    }
   }
-}
-console.log(`\nDone. Imported ${count} keys from ${path.basename(file)}.`);
+  console.log(`\nDone. Imported ${count} keys from ${path.basename(file)}.`);
+})();

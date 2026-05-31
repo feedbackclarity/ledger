@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
-import { getDb } from '@/lib/db';
+import { dbQuery, dbExec } from '@/lib/db';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
+
+export const runtime = 'nodejs';
 
 const MAX_SIZE = 10 * 1024 * 1024; // 10MB
 const ALLOWED_TYPES = ['application/pdf', 'image/jpeg', 'image/png', 'image/jpg'];
@@ -45,9 +47,10 @@ export async function POST(req: NextRequest) {
   const bytes = Buffer.from(await file.arrayBuffer());
   fs.writeFileSync(filepath, bytes);
 
-  getDb()
-    .prepare('INSERT INTO attachments (id, tx_id, filename, original_name, mime_type, size, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(id, txId, filename, file.name, file.type, file.size, Date.now());
+  await dbExec(
+    'INSERT INTO attachments (id, tx_id, filename, original_name, mime_type, size, uploaded_at) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+    [id, txId, filename, file.name, file.type, file.size, Date.now()]
+  );
 
   return NextResponse.json({ id, filename, originalName: file.name, size: file.size });
 }
@@ -59,7 +62,8 @@ export async function GET(req: NextRequest) {
   const fileId = searchParams.get('fileId');
 
   if (fileId) {
-    const row = getDb().prepare('SELECT * FROM attachments WHERE id = ?').get(fileId) as any;
+    const rows = await dbQuery('SELECT * FROM attachments WHERE id = $1', [fileId]);
+    const row = rows[0];
     if (!row) return NextResponse.json({ error: 'not found' }, { status: 404 });
     const filepath = path.join(uploadsDir(), row.filename);
     if (!fs.existsSync(filepath)) return NextResponse.json({ error: 'file missing' }, { status: 404 });
@@ -73,7 +77,10 @@ export async function GET(req: NextRequest) {
   }
 
   if (txId) {
-    const rows = getDb().prepare('SELECT id, original_name as originalName, mime_type as mimeType, size, uploaded_at as uploadedAt FROM attachments WHERE tx_id = ?').all(txId);
+    const rows = await dbQuery(
+      'SELECT id, original_name AS "originalName", mime_type AS "mimeType", size, uploaded_at AS "uploadedAt" FROM attachments WHERE tx_id = $1',
+      [txId]
+    );
     return NextResponse.json({ attachments: rows });
   }
 
@@ -86,11 +93,12 @@ export async function DELETE(req: NextRequest) {
   const fileId = searchParams.get('fileId');
   if (!fileId) return NextResponse.json({ error: 'fileId required' }, { status: 400 });
 
-  const row = getDb().prepare('SELECT filename FROM attachments WHERE id = ?').get(fileId) as { filename: string } | undefined;
+  const rows = await dbQuery('SELECT filename FROM attachments WHERE id = $1', [fileId]);
+  const row = rows[0];
   if (row) {
     const filepath = path.join(uploadsDir(), row.filename);
     if (fs.existsSync(filepath)) fs.unlinkSync(filepath);
-    getDb().prepare('DELETE FROM attachments WHERE id = ?').run(fileId);
+    await dbExec('DELETE FROM attachments WHERE id = $1', [fileId]);
   }
   return NextResponse.json({ deleted: true });
 }
