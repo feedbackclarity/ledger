@@ -221,13 +221,21 @@ function parseStatementText(raw) {
   };
 
   const tx = [];
-  let skipped = 0;
+  const skippedLines = [];
+  const recordSkip = (lineNo, line, reason) => {
+    const trimmed = String(line || '');
+    skippedLines.push({
+      lineNo,
+      line: trimmed.length > 400 ? trimmed.slice(0, 397) + '…' : trimmed,
+      reason,
+    });
+  };
   for (let i = startIdx; i < lines.length; i++) {
     let parts = peelTrailingAmount(splitter(lines[i]));
     if (parts.length < 2) {
       const row = tryRowFallback(lines[i]);
       if (row) { tx.push(row); continue; }
-      skipped++;
+      recordSkip(i + 1, lines[i], 'too-few-columns');
       continue;
     }
 
@@ -244,7 +252,8 @@ function parseStatementText(raw) {
     if (dateIdx === -1 || amountIdx === -1 || isNaN(amountVal)) {
       const row = tryRowFallback(lines[i]);
       if (row) { tx.push(row); continue; }
-      skipped++;
+      // Prefer the more informative reason: missing date is the common PDF-boilerplate case.
+      recordSkip(i + 1, lines[i], dateIdx === -1 ? 'no-date' : 'no-amount');
       continue;
     }
 
@@ -253,11 +262,11 @@ function parseStatementText(raw) {
       if (j !== dateIdx && j !== amountIdx) descParts.push(parts[j]);
     }
     const description = descParts.join(' ').replace(/\s+/g, ' ').trim();
-    if (!description) { skipped++; continue; }
+    if (!description) { recordSkip(i + 1, lines[i], 'empty-description'); continue; }
 
     tx.push({ date: parts[dateIdx], description, amount: amountVal });
   }
-  return { tx, skipped };
+  return { tx, skipped: skippedLines.length, skippedLines };
 }
 
 // ============ MAIN COMPONENT ============
@@ -669,6 +678,9 @@ export default function BudgetPlanner() {
   const [loadedFileName, setLoadedFileName] = useState(null);
   const [pendingFile, setPendingFile] = useState(null); // { name, size, kind }
   const [importAccountId, setImportAccountId] = useState('');
+  const [lastSkippedLines, setLastSkippedLines] = useState([]); // [{lineNo, line, reason}]
+  const [showSkipped, setShowSkipped] = useState(false);
+  const [expandedLogId, setExpandedLogId] = useState(null); // ID of import log row whose skipped lines are expanded
   const [learnStatus, setLearnStatus] = useState('');
   const [suggesting, setSuggesting] = useState(false);
   const [insightsByMonth, setInsightsByMonth] = useState({}); // { monthKey: { insights, generatedAt } }
@@ -912,10 +924,70 @@ export default function BudgetPlanner() {
     }
   };
 
+  // Renders skipped lines grouped by reason. Used in two places: inline after an
+  // import (transient state) and per-row on the Import Log (persisted samples).
+  const renderSkippedGroups = (lines) => {
+    if (!lines || lines.length === 0) return <div style={styles.emptyState}>No skipped lines.</div>;
+    const reasonInfo = {
+      'no-date': {
+        label: 'No date found',
+        hint: 'Typically PDF section headers, account-info rows, page footers, or address blocks.',
+      },
+      'no-amount': {
+        label: 'No amount found',
+        hint: 'Rows with a date but no parseable dollar figure — often transaction-detail continuations or fee notes.',
+      },
+      'too-few-columns': {
+        label: 'Too few columns',
+        hint: 'Lines that did not split into at least two fields and did not match the date+amount fallback regex.',
+      },
+      'empty-description': {
+        label: 'Empty description',
+        hint: 'Date and amount were found but no description remained — rare edge case.',
+      },
+    };
+    const order = ['no-date', 'no-amount', 'too-few-columns', 'empty-description'];
+    const groups = {};
+    lines.forEach((l) => { (groups[l.reason] = groups[l.reason] || []).push(l); });
+    return (
+      <div style={{display: 'flex', flexDirection: 'column', gap: 16}}>
+        {order.filter(r => groups[r] && groups[r].length > 0).map(r => {
+          const list = groups[r];
+          const info = reasonInfo[r] || { label: r, hint: '' };
+          const shown = list.slice(0, 30);
+          const more = list.length - shown.length;
+          return (
+            <div key={r}>
+              <div style={{fontWeight: 600, marginBottom: 4}}>
+                {list.length} {info.label.toLowerCase()}
+              </div>
+              <div style={styles.helperText}>{info.hint}</div>
+              <div style={{...styles.rulesTable, marginTop: 8, maxHeight: 280, overflow: 'auto'}}>
+                {shown.map((l, i) => (
+                  <div key={i} style={{...styles.ruleRow, fontFamily: 'monospace', fontSize: 12, gap: 10}}>
+                    <span style={{flex: '0 0 64px', color: colors.muted}}>L{l.lineNo}</span>
+                    <span style={{flex: 1, whiteSpace: 'pre-wrap', wordBreak: 'break-word'}}>{l.line}</span>
+                  </div>
+                ))}
+                {more > 0 && (
+                  <div style={{...styles.ruleRow, color: colors.muted, fontSize: 12, fontStyle: 'italic'}}>
+                    …and {more} more {info.label.toLowerCase()} line{more === 1 ? '' : 's'} (showing first 30)
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
   const handleImport = () => {
     const parsed = parseStatementText(importText);
     if (parsed.tx.length === 0) {
       setImportStatus(parsed.error || 'No transactions detected. Check format or try a different file.');
+      setLastSkippedLines(Array.isArray(parsed.skippedLines) ? parsed.skippedLines : []);
+      setShowSkipped(false);
       return;
     }
     const convention = detectSignConvention(parsed.tx);
@@ -957,6 +1029,7 @@ export default function BudgetPlanner() {
     // Record an import-log entry. Account is whatever was picked; if blank,
     // we still log it so the user can see the history (the checklist just won't tick).
     const sumAmounts = newTx.reduce((s, t) => s + t.amount, 0);
+    const skippedAll = Array.isArray(parsed.skippedLines) ? parsed.skippedLines : [];
     const logEntry = {
       id: `log-${stamp}`,
       timestamp: stamp,
@@ -971,8 +1044,12 @@ export default function BudgetPlanner() {
       sumAmounts,
       convention,
       txIds: newTx.map(t => t.id),
+      // Cap persisted skipped samples at 100 lines to keep the kv row bounded.
+      skippedSamples: skippedAll.slice(0, 100),
     };
     setImportLog(prev => [logEntry, ...prev]);
+    setLastSkippedLines(skippedAll);
+    setShowSkipped(false);
 
     const acctName = (settings.accounts || []).find(a => a.id === importAccountId)?.name;
     const acctNote = acctName ? ` from ${acctName}` : '';
@@ -1696,6 +1773,18 @@ export default function BudgetPlanner() {
             {importStatus && (
               <div style={/^(no transactions|upload failed|failed to|unsupported|file too large)/i.test(importStatus) ? styles.statusMsgError : styles.statusMsg}>{importStatus}</div>
             )}
+            {lastSkippedLines.length > 0 && (
+              <div style={{marginTop: 10}}>
+                <button style={styles.linkBtn} onClick={() => setShowSkipped(s => !s)}>
+                  {showSkipped ? '▾' : '▸'} Review {lastSkippedLines.length} skipped line{lastSkippedLines.length === 1 ? '' : 's'}
+                </button>
+                {showSkipped && (
+                  <div style={{marginTop: 12, padding: 14, border: `1px solid ${colors.border}`, borderRadius: 8, background: colors.bgSubtle}}>
+                    {renderSkippedGroups(lastSkippedLines)}
+                  </div>
+                )}
+              </div>
+            )}
           </section>
 
           {(settings.accounts || []).length > 0 && (() => {
@@ -1759,49 +1848,71 @@ export default function BudgetPlanner() {
                   <span style={{flex: 1}}>Account / File</span>
                   <span style={{flex: '0 0 70px', textAlign: 'right'}}>Tx</span>
                   <span style={{flex: '0 0 110px', textAlign: 'right'}}>Total</span>
-                  <span style={{flex: '0 0 130px', textAlign: 'right'}}>Actions</span>
+                  <span style={{flex: '0 0 210px', textAlign: 'right'}}>Actions</span>
                 </div>
                 {importLog.map((e, i) => {
                   const acctName = (settings.accounts || []).find(a => a.id === e.accountId)?.name;
+                  const skipSamples = Array.isArray(e.skippedSamples) ? e.skippedSamples : [];
+                  const isExpanded = expandedLogId === e.id;
                   return (
-                    <div key={e.id || i} style={styles.ruleRow}>
-                      <span style={{flex: '0 0 110px', color: colors.muted, fontSize: 12}}>{new Date(e.timestamp).toLocaleDateString()}</span>
-                      <span style={{flex: '0 0 90px', color: colors.muted, fontSize: 12}}>{e.monthKey}</span>
-                      <span style={{flex: 1, fontSize: 13}}>
-                        <strong>{acctName || (e.accountId ? '(unknown account)' : 'Untagged')}</strong>
-                        <span style={{color: colors.muted, marginLeft: 8}}>{e.fileName}</span>
-                      </span>
-                      <span style={{flex: '0 0 70px', textAlign: 'right', fontSize: 13}}>{e.txCount}{e.skippedCount ? ` (-${e.skippedCount})` : ''}</span>
-                      <span style={{flex: '0 0 110px', textAlign: 'right', fontSize: 13, fontWeight: 500}}>{fmtCents(e.sumAmounts)}</span>
-                      <span style={{flex: '0 0 130px', display: 'flex', gap: 6, justifyContent: 'flex-end'}}>
-                        <button
-                          style={styles.linkBtn}
-                          title="Remove log entry only; keep transactions"
-                          onClick={() => {
-                            if (!confirm('Delete this import-log entry? Transactions themselves stay; only the log row is removed.')) return;
-                            setImportLog(prev => prev.filter(x => x.id !== e.id));
-                          }}
-                        >Remove</button>
-                        <button
-                          style={{...styles.linkBtn, color: colors.red}}
-                          title="Remove log entry AND delete the transactions it imported"
-                          disabled={!Array.isArray(e.txIds) || e.txIds.length === 0}
-                          onClick={() => {
-                            const ids = Array.isArray(e.txIds) ? e.txIds : [];
-                            if (ids.length === 0) return;
-                            if (!confirm(`Delete this import-log entry AND remove the ${ids.length} transaction${ids.length === 1 ? '' : 's'} it imported? This cannot be undone.`)) return;
-                            const idSet = new Set(ids);
-                            setTransactions(prev => {
-                              const next = { ...prev };
-                              const list = (next[e.monthKey] || []).filter(t => !idSet.has(t.id));
-                              if (list.length === 0) delete next[e.monthKey]; else next[e.monthKey] = list;
-                              return next;
-                            });
-                            setImportLog(prev => prev.filter(x => x.id !== e.id));
-                          }}
-                        >Remove + tx</button>
-                      </span>
-                    </div>
+                    <React.Fragment key={e.id || i}>
+                      <div style={styles.ruleRow}>
+                        <span style={{flex: '0 0 110px', color: colors.muted, fontSize: 12}}>{new Date(e.timestamp).toLocaleDateString()}</span>
+                        <span style={{flex: '0 0 90px', color: colors.muted, fontSize: 12}}>{e.monthKey}</span>
+                        <span style={{flex: 1, fontSize: 13}}>
+                          <strong>{acctName || (e.accountId ? '(unknown account)' : 'Untagged')}</strong>
+                          <span style={{color: colors.muted, marginLeft: 8}}>{e.fileName}</span>
+                        </span>
+                        <span style={{flex: '0 0 70px', textAlign: 'right', fontSize: 13}}>{e.txCount}{e.skippedCount ? ` (-${e.skippedCount})` : ''}</span>
+                        <span style={{flex: '0 0 110px', textAlign: 'right', fontSize: 13, fontWeight: 500}}>{fmtCents(e.sumAmounts)}</span>
+                        <span style={{flex: '0 0 210px', display: 'flex', gap: 6, justifyContent: 'flex-end', alignItems: 'center'}}>
+                          <button
+                            style={{...styles.linkBtn, opacity: skipSamples.length === 0 ? 0.4 : 1}}
+                            title={skipSamples.length === 0 ? 'No skipped lines recorded for this import' : 'View the lines that were skipped during this import'}
+                            disabled={skipSamples.length === 0}
+                            onClick={() => setExpandedLogId(prev => prev === e.id ? null : e.id)}
+                          >{isExpanded ? 'Hide' : 'View'} skipped{skipSamples.length > 0 ? ` (${skipSamples.length})` : ''}</button>
+                          <button
+                            style={styles.linkBtn}
+                            title="Remove log entry only; keep transactions"
+                            onClick={() => {
+                              if (!confirm('Delete this import-log entry? Transactions themselves stay; only the log row is removed.')) return;
+                              setImportLog(prev => prev.filter(x => x.id !== e.id));
+                              if (expandedLogId === e.id) setExpandedLogId(null);
+                            }}
+                          >Remove</button>
+                          <button
+                            style={{...styles.linkBtn, color: colors.red}}
+                            title="Remove log entry AND delete the transactions it imported"
+                            disabled={!Array.isArray(e.txIds) || e.txIds.length === 0}
+                            onClick={() => {
+                              const ids = Array.isArray(e.txIds) ? e.txIds : [];
+                              if (ids.length === 0) return;
+                              if (!confirm(`Delete this import-log entry AND remove the ${ids.length} transaction${ids.length === 1 ? '' : 's'} it imported? This cannot be undone.`)) return;
+                              const idSet = new Set(ids);
+                              setTransactions(prev => {
+                                const next = { ...prev };
+                                const list = (next[e.monthKey] || []).filter(t => !idSet.has(t.id));
+                                if (list.length === 0) delete next[e.monthKey]; else next[e.monthKey] = list;
+                                return next;
+                              });
+                              setImportLog(prev => prev.filter(x => x.id !== e.id));
+                              if (expandedLogId === e.id) setExpandedLogId(null);
+                            }}
+                          >Remove + tx</button>
+                        </span>
+                      </div>
+                      {isExpanded && skipSamples.length > 0 && (
+                        <div style={{padding: '14px 16px', background: colors.bgSubtle, borderRadius: 8, marginTop: -4, marginBottom: 8}}>
+                          {e.skippedCount > skipSamples.length && (
+                            <div style={{...styles.helperText, marginBottom: 10, fontStyle: 'italic'}}>
+                              Showing the first {skipSamples.length} of {e.skippedCount} skipped lines (the rest weren't persisted).
+                            </div>
+                          )}
+                          {renderSkippedGroups(skipSamples)}
+                        </div>
+                      )}
+                    </React.Fragment>
                   );
                 })}
               </div>
