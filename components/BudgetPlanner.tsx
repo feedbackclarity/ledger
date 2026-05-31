@@ -182,8 +182,24 @@ function parseStatementText(raw) {
     splitter = l => l.split(/\s{2,}|\t+/).map(p => p.trim()).filter(Boolean);
   }
 
+  // Chase/Amex PDFs often emit "MERCHANT CA1.99" with the state code glued to the amount.
+  // Peel a trailing dollar-amount off the last token after splitting so the normal
+  // date+amount detector still works.
+  const peelTrailingAmount = (parts) => {
+    if (!parts || parts.length === 0) return parts;
+    const last = String(parts[parts.length - 1] || '');
+    const m = last.match(/^(.*?)(\(?-?[\$£€]?[\d,]+\.\d{2}\)?-?)$/);
+    if (!m) return parts;
+    const lead = m[1].trim();
+    const amt = m[2];
+    if (!lead) return parts;
+    // Guard: lead must contain a letter so we don't split "12.341.99" into "12.34" + "1.99".
+    if (!/[A-Za-z]/.test(lead)) return parts;
+    return [...parts.slice(0, -1), lead, amt];
+  };
+
   let startIdx = 0;
-  const firstParts = splitter(lines[0]);
+  const firstParts = peelTrailingAmount(splitter(lines[0]));
   const hasHeaderWord = firstParts.some(p => HEADER_TOKENS.test(p));
   const firstHasAmount = firstParts.some(p => !isNaN(parseAmount(p)) && /\d/.test(p));
   if (hasHeaderWord && !firstHasAmount) startIdx = 1;
@@ -194,8 +210,9 @@ function parseStatementText(raw) {
 
   // H1 fallback: peel a leading date + trailing amount out of a single line.
   // Used when the splitter leaves <2 parts or when date/amount detection fails.
+  // `\s*` (not `\s+`) before the amount handles concatenated state-codes-then-amount.
   const tryRowFallback = (line) => {
-    const m = line.match(/^(\d{1,4}[-\/.]\d{1,2}(?:[-\/.]\d{1,4})?)\s+(.*?)\s+(\(?[\$£€]?\-?[\d,]+\.\d{2}\)?\-?)$/);
+    const m = line.match(/^(\d{1,4}[-\/.]\d{1,2}(?:[-\/.]\d{1,4})?)\s+(.*?)\s*(\(?[\$£€]?\-?[\d,]+\.\d{2}\)?\-?)$/);
     if (!m) return null;
     const amt = parseAmount(m[3]);
     const desc = m[2].trim();
@@ -206,7 +223,7 @@ function parseStatementText(raw) {
   const tx = [];
   let skipped = 0;
   for (let i = startIdx; i < lines.length; i++) {
-    let parts = splitter(lines[i]);
+    let parts = peelTrailingAmount(splitter(lines[i]));
     if (parts.length < 2) {
       const row = tryRowFallback(lines[i]);
       if (row) { tx.push(row); continue; }
@@ -473,6 +490,86 @@ export default function BudgetPlanner() {
   }, [settings.appName]);
 
   // ============ DERIVED STATE ============
+  // 12-month trend data: monthly totals, top categories with per-month series.
+  const trendsData = useMemo(() => {
+    const now = new Date();
+    const months = [];
+    for (let i = 11; i >= 0; i--) {
+      months.push(monthKey(new Date(now.getFullYear(), now.getMonth() - i, 1)));
+    }
+    const personalByMonth = months.map(m =>
+      (transactions[m] || []).filter(t => t.classification === 'personal')
+    );
+    const monthlyTotals = personalByMonth.map(txs =>
+      txs.reduce((s, t) => s + Math.abs(t.amount), 0)
+    );
+    const catSeries = {};
+    months.forEach((m, idx) => {
+      personalByMonth[idx].forEach(t => {
+        const cat = t.category || 'uncategorized';
+        if (!catSeries[cat]) catSeries[cat] = months.map(() => 0);
+        catSeries[cat][idx] += Math.abs(t.amount);
+      });
+    });
+    const topCats = (Object.entries(catSeries) as Array<[string, number[]]>)
+      .map(([id, values]) => ({
+        id,
+        values,
+        sum: values.reduce((s, v) => s + v, 0),
+      }))
+      .filter(c => c.sum > 0)
+      .sort((a, b) => b.sum - a.sum)
+      .slice(0, 8);
+    return { months, monthlyTotals, topCats };
+  }, [transactions]);
+
+  const [trendInsights, setTrendInsights] = useState(null); // {insights, generatedAt} or null
+  const [generatingTrendInsights, setGeneratingTrendInsights] = useState(false);
+  const [trendInsightsError, setTrendInsightsError] = useState('');
+
+  const getTrendInsights = async () => {
+    setGeneratingTrendInsights(true);
+    setTrendInsightsError('');
+    try {
+      const topCategories = trendsData.topCats.map(c => ({
+        id: c.id,
+        name: (categories.find(cc => cc.id === c.id)?.name) || c.id,
+        values: c.values,
+      }));
+      const r = await fetch('/api/insights-trends', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          months: trendsData.months,
+          monthlyTotals: trendsData.monthlyTotals,
+          topCategories,
+          cushionCurrent: settings.cushionCurrent,
+          cushionTarget: settings.cushionTarget,
+        }),
+      });
+      const ct = r.headers.get('content-type') || '';
+      const text = await r.text();
+      if (!ct.toLowerCase().includes('application/json')) {
+        setTrendInsightsError(`AI error (HTTP ${r.status}): ${(text || '').slice(0, 200)}`);
+        return;
+      }
+      let j;
+      try { j = JSON.parse(text); } catch {
+        setTrendInsightsError(`AI error (HTTP ${r.status}): invalid JSON body`);
+        return;
+      }
+      if (!r.ok) {
+        setTrendInsightsError(`AI error (HTTP ${r.status}): ${j.error || 'unknown'}`);
+        return;
+      }
+      setTrendInsights({ insights: j.insights || [], generatedAt: j.generatedAt || Date.now() });
+    } catch (e) {
+      setTrendInsightsError(`AI request failed: ${(e && e.message) || 'unknown'}`);
+    } finally {
+      setGeneratingTrendInsights(false);
+    }
+  };
+
   const monthOptions = useMemo(() => {
     const now = new Date();
     const set = new Set();
@@ -1002,6 +1099,7 @@ export default function BudgetPlanner() {
       <nav style={styles.nav}>
         {[
           { id: 'dashboard', label: 'Dashboard' },
+          { id: 'trends', label: 'Trends' },
           { id: 'import', label: 'Import' },
           { id: 'transactions', label: `Transactions ${monthTx.length ? `(${monthTx.length})` : ''}` },
           { id: 'categories', label: 'Categories & Targets' },
@@ -1340,6 +1438,184 @@ export default function BudgetPlanner() {
           })()}
         </div>
       )}
+
+      {/* ============ TRENDS ============ */}
+      {view === 'trends' && (() => {
+        const { months, monthlyTotals, topCats } = trendsData;
+        const total12 = monthlyTotals.reduce((s, v) => s + v, 0);
+        const nonZero = monthlyTotals.filter(v => v > 0).length;
+        const avg = nonZero > 0 ? total12 / nonZero : 0;
+        const last3 = monthlyTotals.slice(-3).reduce((s, v) => s + v, 0) / 3;
+        const prior3 = monthlyTotals.slice(-6, -3).reduce((s, v) => s + v, 0) / 3;
+        const trendPct = prior3 > 0 ? ((last3 - prior3) / prior3) * 100 : 0;
+        const maxSpend = Math.max(...monthlyTotals, 1);
+
+        // SVG sizing
+        const W = 900, H = 280, PAD_L = 60, PAD_R = 20, PAD_T = 30, PAD_B = 40;
+        const innerW = W - PAD_L - PAD_R;
+        const innerH = H - PAD_T - PAD_B;
+        const colW = innerW / months.length;
+        const barW = Math.max(colW - 10, 6);
+
+        const sparklinePath = (values) => {
+          const max = Math.max(...values, 1);
+          const w = 90, h = 20;
+          return values.map((v, i) => {
+            const x = (i / (values.length - 1)) * w;
+            const y = h - (v / max) * h;
+            return `${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
+          }).join(' ');
+        };
+
+        return (
+          <div>
+            <section style={styles.statusStrip}>
+              <div style={styles.statusCard}>
+                <div style={styles.statusLabel}>12-mo Total Spend</div>
+                <div style={styles.statusBig}>{fmt(total12)}</div>
+                <div style={styles.statusSub}>Personal only</div>
+              </div>
+              <div style={styles.statusCard}>
+                <div style={styles.statusLabel}>Avg / Active Month</div>
+                <div style={styles.statusBig}>{fmt(avg)}</div>
+                <div style={styles.statusSub}>{nonZero} of 12 months active</div>
+              </div>
+              <div style={styles.statusCard}>
+                <div style={styles.statusLabel}>3-mo vs Prior 3-mo</div>
+                <div style={{...styles.statusBig, color: trendPct > 5 ? colors.red : (trendPct < -5 ? colors.green : colors.text)}}>
+                  {trendPct >= 0 ? '+' : ''}{trendPct.toFixed(1)}%
+                </div>
+                <div style={styles.statusSub}>{fmt(last3)} / mo recently</div>
+              </div>
+            </section>
+
+            <section style={styles.section}>
+              <h2 style={styles.sectionTitle}>Monthly Spend — Last 12 Months</h2>
+              {total12 === 0 ? (
+                <div style={styles.emptyState}>No personal transactions in the last 12 months yet. Import some statements.</div>
+              ) : (
+                <svg viewBox={`0 0 ${W} ${H}`} style={{width: '100%', height: 'auto', overflow: 'visible'}}>
+                  {/* Y-axis gridlines */}
+                  {[0.25, 0.5, 0.75, 1].map(frac => {
+                    const y = PAD_T + innerH - innerH * frac;
+                    const value = maxSpend * frac;
+                    return (
+                      <g key={frac}>
+                        <line x1={PAD_L} y1={y} x2={W - PAD_R} y2={y} stroke={colors.border} strokeWidth={1} strokeDasharray="3 4" />
+                        <text x={PAD_L - 8} y={y + 4} textAnchor="end" fill={colors.muted} fontSize={11}>{fmt(value)}</text>
+                      </g>
+                    );
+                  })}
+                  {/* Bars */}
+                  {monthlyTotals.map((v, i) => {
+                    const barH = (v / maxSpend) * innerH;
+                    const x = PAD_L + i * colW + (colW - barW) / 2;
+                    const y = PAD_T + innerH - barH;
+                    const [yy, mm] = months[i].split('-');
+                    return (
+                      <g key={months[i]}>
+                        <rect x={x} y={y} width={barW} height={barH} fill={colors.accent} rx={3} />
+                        <text x={x + barW / 2} y={PAD_T + innerH + 16} textAnchor="middle" fill={colors.muted} fontSize={10}>
+                          {mm}/{yy.slice(2)}
+                        </text>
+                        {v > 0 && (
+                          <text x={x + barW / 2} y={y - 6} textAnchor="middle" fill={colors.text} fontSize={10} fontWeight={500}>
+                            {v > 999 ? `${Math.round(v / 1000)}k` : Math.round(v).toString()}
+                          </text>
+                        )}
+                      </g>
+                    );
+                  })}
+                  <line x1={PAD_L} y1={PAD_T + innerH} x2={W - PAD_R} y2={PAD_T + innerH} stroke={colors.borderStrong} strokeWidth={1} />
+                </svg>
+              )}
+            </section>
+
+            <section style={styles.section}>
+              <h2 style={styles.sectionTitle}>Top Categories — 12-Month Trend</h2>
+              {topCats.length === 0 ? (
+                <div style={styles.emptyState}>No category data yet.</div>
+              ) : (
+                <div style={styles.rulesTable}>
+                  <div style={{...styles.ruleRow, fontWeight: 600, color: colors.muted, fontSize: 12, textTransform: 'uppercase', letterSpacing: 0.4}}>
+                    <span style={{flex: 1}}>Category</span>
+                    <span style={{flex: '0 0 110px'}}>Sparkline</span>
+                    <span style={{flex: '0 0 110px', textAlign: 'right'}}>12-mo Total</span>
+                    <span style={{flex: '0 0 90px', textAlign: 'right'}}>Avg/mo</span>
+                    <span style={{flex: '0 0 90px', textAlign: 'right'}}>Last mo</span>
+                  </div>
+                  {topCats.map(c => {
+                    const name = (categories.find(cc => cc.id === c.id)?.name) || c.id;
+                    const avgC = c.sum / 12;
+                    const last = c.values[c.values.length - 1] || 0;
+                    return (
+                      <div key={c.id} style={styles.ruleRow}>
+                        <span style={{flex: 1, fontWeight: 500}}>{name}</span>
+                        <span style={{flex: '0 0 110px'}}>
+                          <svg viewBox="0 0 90 20" style={{width: 100, height: 22}}>
+                            <path d={sparklinePath(c.values)} fill="none" stroke={colors.accent} strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </span>
+                        <span style={{flex: '0 0 110px', textAlign: 'right', fontWeight: 500, fontSize: 13}}>{fmt(c.sum)}</span>
+                        <span style={{flex: '0 0 90px', textAlign: 'right', color: colors.muted, fontSize: 13}}>{fmt(avgC)}</span>
+                        <span style={{flex: '0 0 90px', textAlign: 'right', fontSize: 13}}>{fmt(last)}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+
+            <section style={styles.section}>
+              <h2 style={styles.sectionTitle}>AI Insights — Multi-Month Patterns</h2>
+              {!trendInsights ? (
+                <>
+                  <div style={styles.helperText}>
+                    Ask Claude to look at the last 12 months of spend trajectories and call out what's
+                    trending up, what's holding, and where the cushion is heading.
+                  </div>
+                  <button style={styles.primaryBtn} onClick={getTrendInsights} disabled={generatingTrendInsights || total12 === 0}>
+                    {generatingTrendInsights ? 'Asking Claude…' : '✨ Generate trend insights'}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12}}>
+                    <span style={{color: colors.muted, fontSize: 12}}>
+                      Generated {new Date(trendInsights.generatedAt).toLocaleString()}
+                    </span>
+                    <button style={styles.linkBtn} onClick={getTrendInsights} disabled={generatingTrendInsights}>
+                      {generatingTrendInsights ? 'Refreshing…' : '↻ Refresh'}
+                    </button>
+                  </div>
+                  {(!trendInsights.insights || trendInsights.insights.length === 0) ? (
+                    <div style={styles.emptyState}>No insights returned. Try again.</div>
+                  ) : (
+                    <div style={{display: 'flex', flexDirection: 'column', gap: 10}}>
+                      {trendInsights.insights.map((ins, i) => {
+                        const sev = (ins.severity || 'medium').toLowerCase();
+                        const variant = sev === 'high' ? styles.insightHigh : (sev === 'low' ? styles.insightLow : styles.insightMedium);
+                        const catName = (categories.find(c => c.id === ins.category)?.name) || ins.category;
+                        return (
+                          <div key={i} style={{...styles.insightCard, ...variant}}>
+                            <div style={styles.insightMeta}>
+                              <span style={{fontWeight: 700, textTransform: 'uppercase', fontSize: 11, letterSpacing: 0.5}}>{sev}</span>
+                              {ins.action && <span style={{textTransform: 'capitalize', fontSize: 12, opacity: 0.75}}>· {ins.action}</span>}
+                              {catName && <span style={{fontSize: 12, opacity: 0.75}}>· {catName}</span>}
+                            </div>
+                            <div style={{fontSize: 14, lineHeight: 1.5}}>{ins.message}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </>
+              )}
+              {trendInsightsError && <div style={styles.statusMsgError}>{trendInsightsError}</div>}
+            </section>
+          </div>
+        );
+      })()}
 
       {/* ============ IMPORT ============ */}
       {view === 'import' && (
