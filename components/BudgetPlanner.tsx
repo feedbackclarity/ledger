@@ -294,73 +294,87 @@ export default function BudgetPlanner() {
   const [snapshots, setSnapshots] = useState([]); // [{date: 'YYYY-MM-DD', takenAt}]
   const [snapshotTodayChecked, setSnapshotTodayChecked] = useState(false);
   const [restoreBanner, setRestoreBanner] = useState(null); // { txCount, ts } or null
+  // When a load fails on the SERVER (not just a missing key), we freeze ALL
+  // auto-saves (server + localStorage mirror). This is the guard that stops a
+  // transient DB outage from silently overwriting good data with empty defaults.
+  const [loadFailed, setLoadFailed] = useState(false);
+
+  const loadFromStorage = async () => {
+    const keys = ['categories', 'rules', 'transactions', 'income', 'settings', 'importLog', 'snapshotIndex'];
+    const results = await Promise.all(keys.map(k => window.storage.getSafe(k)));
+    const byKey = {};
+    keys.forEach((k, i) => { byKey[k] = results[i]; });
+
+    // If ANY key hit a real server error (not just "missing"), abort the load,
+    // keep state at defaults, and DO NOT clear loadFailed — saves stay frozen.
+    const errored = keys.filter(k => byKey[k].status === 'error');
+    if (errored.length > 0) {
+      console.error('[load] server errors on', errored.map(k => `${k}:${byKey[k].code}`).join(', '));
+      setLoadFailed(true);
+      setLoading(false);
+      return;
+    }
+
+    const val = (k) => byKey[k].status === 'ok' ? byKey[k].value : null;
+    try {
+      if (val('categories')) setCategories(JSON.parse(val('categories')));
+      if (val('rules')) setRules(JSON.parse(val('rules')));
+      if (val('transactions')) setTransactions(JSON.parse(val('transactions')));
+      if (val('income')) setIncome(JSON.parse(val('income')));
+      if (val('settings')) {
+        const loaded = JSON.parse(val('settings'));
+        setSettings({
+          ...loaded,
+          accounts: loaded.accounts || [],
+          appName: loaded.appName || 'Ledger',
+          theme: loaded.theme === 'dark' ? 'dark' : 'light',
+        });
+      }
+      if (val('importLog')) setImportLog(JSON.parse(val('importLog')));
+      if (val('snapshotIndex')) setSnapshots(JSON.parse(val('snapshotIndex')));
+    } catch (e) {
+      console.error('[load] parse error', e);
+    }
+    setLoadFailed(false);
+    setLoading(false);
+  };
 
   // Load from storage on mount
   useEffect(() => {
-    (async () => {
-      try {
-        const [catsRes, rulesRes, txRes, incRes, setRes, logRes, snapIdxRes] = await Promise.all([
-          window.storage.get('categories').catch(() => null),
-          window.storage.get('rules').catch(() => null),
-          window.storage.get('transactions').catch(() => null),
-          window.storage.get('income').catch(() => null),
-          window.storage.get('settings').catch(() => null),
-          window.storage.get('importLog').catch(() => null),
-          window.storage.get('snapshotIndex').catch(() => null),
-        ]);
-        if (catsRes) setCategories(JSON.parse(catsRes.value));
-        if (rulesRes) setRules(JSON.parse(rulesRes.value));
-        if (txRes) setTransactions(JSON.parse(txRes.value));
-        if (incRes) setIncome(JSON.parse(incRes.value));
-        if (setRes) {
-          const loaded = JSON.parse(setRes.value);
-          // Forward-compat: ensure new fields exist for old persisted settings
-          setSettings({
-            ...loaded,
-            accounts: loaded.accounts || [],
-            appName: loaded.appName || 'Ledger',
-            theme: loaded.theme === 'dark' ? 'dark' : 'light',
-          });
-        }
-        if (logRes) setImportLog(JSON.parse(logRes.value));
-        if (snapIdxRes) setSnapshots(JSON.parse(snapIdxRes.value));
-      } catch (e) {
-        console.log('First run or storage error', e);
-      }
-      setLoading(false);
-    })();
+    loadFromStorage();
   }, []);
 
-  // Save helpers (debounced via effect)
+  // Save helpers (debounced via effect). Frozen while loading OR after a failed
+  // load — never write defaults over data we simply couldn't read.
   useEffect(() => {
-    if (loading) return;
+    if (loading || loadFailed) return;
     window.storage.set('categories', JSON.stringify(categories)).catch(console.error);
-  }, [categories, loading]);
+  }, [categories, loading, loadFailed]);
 
   useEffect(() => {
-    if (loading) return;
+    if (loading || loadFailed) return;
     window.storage.set('rules', JSON.stringify(rules)).catch(console.error);
-  }, [rules, loading]);
+  }, [rules, loading, loadFailed]);
 
   useEffect(() => {
-    if (loading) return;
+    if (loading || loadFailed) return;
     window.storage.set('transactions', JSON.stringify(transactions)).catch(console.error);
-  }, [transactions, loading]);
+  }, [transactions, loading, loadFailed]);
 
   useEffect(() => {
-    if (loading) return;
+    if (loading || loadFailed) return;
     window.storage.set('income', JSON.stringify(income)).catch(console.error);
-  }, [income, loading]);
+  }, [income, loading, loadFailed]);
 
   useEffect(() => {
-    if (loading) return;
+    if (loading || loadFailed) return;
     window.storage.set('settings', JSON.stringify(settings)).catch(console.error);
-  }, [settings, loading]);
+  }, [settings, loading, loadFailed]);
 
   useEffect(() => {
-    if (loading) return;
+    if (loading || loadFailed) return;
     window.storage.set('importLog', JSON.stringify(importLog)).catch(console.error);
-  }, [importLog, loading]);
+  }, [importLog, loading, loadFailed]);
 
   // ============ BACKUP / RESTORE / SNAPSHOTS ============
   const todayKey = () => new Date().toISOString().slice(0, 10);
@@ -417,17 +431,39 @@ export default function BudgetPlanner() {
     }
   };
 
-  // Mirror full state into the browser's localStorage on every change. If the
-  // server kv is ever wiped (a redeploy on the basic-xxs tier where DATA_DIR
-  // is ephemeral), the user can restore from this mirror.
+  // Mirror full state into the browser's localStorage on every change — the
+  // last-resort backup if server data is ever lost.
+  //
+  // Two hard guards prevent the mirror from being destroyed:
+  //  1. Frozen while `loading` or `loadFailed` (a failed server read must never
+  //     trigger a mirror overwrite with empty defaults — this was the bug that
+  //     wiped real data after the Postgres SSL outage).
+  //  2. Refuse to overwrite a NON-EMPTY mirror with EMPTY current state. If the
+  //     app somehow holds nothing but the mirror holds transactions, keep the
+  //     mirror — the user can explicitly restore it.
   useEffect(() => {
-    if (loading) return;
+    if (loading || loadFailed) return;
     if (typeof window === 'undefined' || !window.localStorage) return;
+    const currentTxCount = Object.values(transactions || {}).reduce(
+      (s: number, arr: any) => s + (Array.isArray(arr) ? arr.length : 0), 0
+    );
+    const currentEmpty = currentTxCount === 0 && importLog.length === 0 && rules.length === 0;
     try {
+      if (currentEmpty) {
+        const raw = window.localStorage.getItem('ledger:mirror');
+        if (raw) {
+          const prev = JSON.parse(raw);
+          const prevTx = Object.values(prev.transactions || {}).reduce(
+            (s: number, arr: any) => s + (Array.isArray(arr) ? arr.length : 0), 0
+          ) as number;
+          const prevHadData = prevTx > 0 || (prev.importLog && prev.importLog.length > 0) || (prev.rules && prev.rules.length > 0);
+          if (prevHadData) return; // don't clobber a good backup with nothing
+        }
+      }
       const mirror = { categories, rules, transactions, income, settings, importLog, ts: Date.now(), v: 1 };
       window.localStorage.setItem('ledger:mirror', JSON.stringify(mirror));
     } catch { /* quota or private mode — skip */ }
-  }, [categories, rules, transactions, income, settings, importLog, loading]);
+  }, [categories, rules, transactions, income, settings, importLog, loading, loadFailed]);
 
   // Surface a restore banner when the server has empty data but localStorage
   // has a non-empty mirror — typical "the redeploy wiped me" recovery case.
@@ -465,7 +501,7 @@ export default function BudgetPlanner() {
 
   // Take one snapshot per calendar day, the first time the app loads that day.
   useEffect(() => {
-    if (loading) return;
+    if (loading || loadFailed) return;
     if (snapshotTodayChecked) return;
     const today = todayKey();
     if (snapshots.some(s => s.date === today)) {
@@ -1137,6 +1173,19 @@ export default function BudgetPlanner() {
   return (
     <div style={styles.app}>
       <style>{globalCss}</style>
+
+      {loadFailed && (
+        <div style={styles.loadFailedBanner}>
+          <div>
+            <strong>Couldn't load your data from the server.</strong> To protect your saved
+            data, the app has <strong>frozen all saves</strong> — nothing will be overwritten.
+            Don't re-enter data yet; click Retry once, and if it keeps failing, leave this tab open and tell Claude.
+          </div>
+          <div style={{display: 'flex', gap: 8}}>
+            <button style={styles.primaryBtn} onClick={() => { setLoading(true); loadFromStorage(); }}>Retry</button>
+          </div>
+        </div>
+      )}
 
       {restoreBanner && (
         <div style={styles.restoreBanner}>
@@ -2887,6 +2936,17 @@ const styles: Record<string, React.CSSProperties> = {
     background: colors.amberBg,
     borderBottom: `1px solid #fcd34d`,
     color: colors.amber,
+    fontSize: 14,
+  },
+  loadFailedBanner: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 16,
+    padding: '14px 20px',
+    background: colors.redBg,
+    borderBottom: `1px solid #fecaca`,
+    color: colors.red,
     fontSize: 14,
   },
   insightCard: {
