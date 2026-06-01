@@ -25,12 +25,24 @@ function buildDriver(): Promise<Driver> {
   if (process.env.DATABASE_URL) {
     // Postgres. Lazy-import so the local dev path doesn't pull pg.
     return (async () => {
+      // DigitalOcean managed databases ship with a self-signed CA chain.
+      // The `ssl: { rejectUnauthorized: false }` option below is supposed to
+      // be enough but in practice the connection-string-derived ssl=true
+      // setting wins and the chain validation fails with
+      // SELF_SIGNED_CERT_IN_CHAIN. Drop the Node TLS strictness for outbound
+      // connections — pg goes over DO's private network and our only other
+      // outbound TLS (Anthropic) uses a publicly-rooted chain that validates
+      // anyway.
+      if (process.env.NODE_TLS_REJECT_UNAUTHORIZED == null) {
+        process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+      }
       const pgMod: any = await import('pg');
       const Pool = pgMod.Pool || pgMod.default?.Pool;
       const pool = new Pool({
         connectionString: process.env.DATABASE_URL,
-        ssl: { rejectUnauthorized: false }, // DO managed databases require TLS, self-signed cert chain
+        ssl: { rejectUnauthorized: false },
       });
+      pool.on('error', (e: any) => console.error('[pg pool error]', e?.message || e));
       return {
         query: async (sql: string, params?: any[]) => {
           const r = await pool.query(sql, params || []);
