@@ -19,7 +19,7 @@ type Driver = {
 };
 
 let driverPromise: Promise<Driver> | null = null;
-let schemaInited = false;
+let schemaPromise: Promise<void> | null = null;
 
 function buildDriver(): Promise<Driver> {
   if (process.env.DATABASE_URL) {
@@ -80,19 +80,22 @@ function getDriver(): Promise<Driver> {
   return driverPromise;
 }
 
-async function ensureSchema() {
-  if (schemaInited) return;
+// `CREATE TABLE IF NOT EXISTS` is NOT safe under concurrency in Postgres —
+// two connections racing both try to insert the table's row-type and one
+// dies with duplicate key on pg_type_typname_nsp_index. Cache the init
+// *promise* (not a boolean set after the awaits) so schema setup runs exactly
+// once per process, and swallow the duplicate-key race in case another
+// instance got there first.
+async function runSchema() {
   const d = await getDriver();
-  // Types chosen to work on both Postgres and SQLite (which collates BIGINT → INTEGER).
-  await d.query(`
-    CREATE TABLE IF NOT EXISTS kv (
+  const ddl = [
+    // Types chosen to work on both Postgres and SQLite (which collates BIGINT → INTEGER).
+    `CREATE TABLE IF NOT EXISTS kv (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL,
       updated_at BIGINT NOT NULL
-    )
-  `);
-  await d.query(`
-    CREATE TABLE IF NOT EXISTS attachments (
+    )`,
+    `CREATE TABLE IF NOT EXISTS attachments (
       id TEXT PRIMARY KEY,
       tx_id TEXT NOT NULL,
       filename TEXT NOT NULL,
@@ -100,10 +103,31 @@ async function ensureSchema() {
       mime_type TEXT NOT NULL,
       size BIGINT NOT NULL,
       uploaded_at BIGINT NOT NULL
-    )
-  `);
-  await d.query(`CREATE INDEX IF NOT EXISTS idx_attachments_tx ON attachments(tx_id)`);
-  schemaInited = true;
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_attachments_tx ON attachments(tx_id)`,
+  ];
+  for (const stmt of ddl) {
+    try {
+      await d.query(stmt);
+    } catch (e: any) {
+      // 23505 = unique_violation (the pg_type race), 42P07 = duplicate_table,
+      // 42P06 = duplicate_schema. All mean "someone created it already" — fine.
+      const code = e?.code;
+      if (code === '23505' || code === '42P07' || code === '42P06') continue;
+      throw e;
+    }
+  }
+}
+
+function ensureSchema(): Promise<void> {
+  if (!schemaPromise) {
+    schemaPromise = runSchema().catch((e) => {
+      // Reset so a later request can retry rather than caching a failure forever.
+      schemaPromise = null;
+      throw e;
+    });
+  }
+  return schemaPromise;
 }
 
 export async function kvGet(key: string): Promise<string | null> {
